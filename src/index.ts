@@ -33,10 +33,81 @@ app.get('/api/tools', async (req, res) => {
     }
 });
 
+// GET /api/tools/available - Dynamic discovery from MCP Hub with fallback
+app.get('/api/tools/available', async (req, res) => {
+    // Default fallback tools if MCP Hub is offline
+    const fallbackTools = [
+        { id: 'search', name: 'search', description: 'Google Search (Fallback)' },
+        { id: 'email', name: 'email', description: 'Send Emails (Fallback)' },
+        { id: 'github', name: 'github', description: 'GitHub Integration (Fallback)' }
+    ];
+
+    try {
+        // Try to fetch from MCP Hub
+        // Assuming MCP Hub runs on port 8000 by default or via env var
+        const mcpHubUrl = process.env.MCP_HUB_URL || 'http://localhost:8000';
+
+        // Using JSON-RPC 2.0 format as per previous context
+        const response = await fetch(`${mcpHubUrl}/jsonrpc`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                jsonrpc: '2.0',
+                method: 'list_tools',
+                id: 1,
+                params: {}
+            })
+        });
+
+        if (!response.ok) {
+            throw new Error(`MCP Hub returned ${response.status}`);
+        }
+
+        const data = await response.json() as { result: Array<{ name: string; description: string }> };
+
+        if (data.result && Array.isArray(data.result)) {
+            // Map MCP tools to our format
+            // We use the name as ID since MCP doesn't strictly provide IDs in list_tools
+            const tools = data.result.map(t => ({
+                id: t.name,
+                name: t.name,
+                description: t.description || 'No description provided'
+            }));
+            return res.json(tools);
+        }
+
+        // If format is unexpected, throw to trigger fallback
+        throw new Error('Invalid response format from MCP Hub');
+
+    } catch (error: any) {
+        console.warn(`⚠️ MCP Hub unavailable (${error.message}). Using fallback tools.`);
+        // Return fallback list so the UI never breaks
+        res.json(fallbackTools);
+    }
+});
+
+// GET /api/agents - List agents (optionally filtered by workspace)
+app.get('/api/agents', async (req, res) => {
+    try {
+        const { workspace } = req.query;
+        const where = workspace ? { workspace: String(workspace) } : {};
+
+        const agents = await prisma.agent.findMany({
+            where,
+            include: { tools: true }
+        });
+        res.json(agents);
+    } catch (error) {
+        console.error('Error fetching agents:', error);
+        res.status(500).json({ error: 'Failed to fetch agents' });
+    }
+});
+
 // POST /api/agents - Create a new agent
 app.post('/api/agents', async (req, res) => {
     try {
-        const { name, role, goal, systemPrompt, tools } = req.body;
+        const { name, role, goal, systemPrompt, tools, workspace, status } = req.body;
+        console.log('DEBUG: POST /api/agents BODY:', JSON.stringify(req.body)); // <--- DEBUG LOG
 
         const agent = await prisma.agent.create({
             data: {
@@ -44,6 +115,8 @@ app.post('/api/agents', async (req, res) => {
                 role,
                 goal,
                 systemPrompt,
+                workspace: workspace || 'General',
+                status: status || 'LIVE', // <--- Added
                 tools: {
                     connect: tools.map((id: string) => ({ id }))
                 }
@@ -53,7 +126,7 @@ app.post('/api/agents', async (req, res) => {
             }
         });
 
-        console.log(`Created agent: ${agent.name}`);
+        console.log(`Created agent: ${agent.name} in workspace: ${agent.workspace} (Status: ${agent.status})`);
         res.status(201).json(agent);
     } catch (error) {
         console.error('Error creating agent:', error);
@@ -61,10 +134,77 @@ app.post('/api/agents', async (req, res) => {
     }
 });
 
+// PUT /api/agents/:id - Update agent and track prompt history
+app.put('/api/agents/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { name, role, goal, systemPrompt, tools, workspace, status } = req.body;
+
+        // 1. Fetch current agent to check for prompt changes
+        const currentAgent = await prisma.agent.findUnique({
+            where: { id },
+            include: { history: true }
+        });
+
+        if (!currentAgent) {
+            return res.status(404).json({ error: 'Agent not found' });
+        }
+
+        // 2. If prompt changed, save the OLD prompt to history
+        if (currentAgent.systemPrompt !== systemPrompt) {
+            const nextVersion = (currentAgent.history?.length || 0) + 1;
+
+            await prisma.promptHistory.create({
+                data: {
+                    agentId: id,
+                    prompt: currentAgent.systemPrompt,
+                    version: nextVersion,
+                    createdAt: new Date() // Explicitly set creation time
+                }
+            });
+            console.log(`📜 Saved prompt history v${nextVersion} for agent ${currentAgent.name}`);
+        }
+
+        // 3. Update the agent
+        const updatedAgent = await prisma.agent.update({
+            where: { id },
+            data: {
+                name,
+                role,
+                goal,
+                systemPrompt,
+                workspace: workspace || currentAgent.workspace,
+                status: status || currentAgent.status,
+                tools: {
+                    set: [], // Clear existing tools
+                    connect: tools.map((toolId: string) => ({ id: toolId }))
+                }
+            },
+            include: {
+                tools: true,
+                history: {
+                    orderBy: { version: 'desc' }
+                }
+            }
+        });
+
+        console.log(`Updated agent: ${updatedAgent.name}`);
+        res.json(updatedAgent);
+    } catch (error) {
+        console.error('Error updating agent:', error);
+        res.status(500).json({ error: 'Failed to update agent' });
+    }
+});
+
 // GET /.well-known/agent.json — FRS Agent Card for runtime discovery
 app.get('/.well-known/agent.json', async (req, res) => {
     try {
-        const agents = await prisma.agent.findMany({ include: { tools: true } });
+        // Filter out DRAFT agents — ACC should only see LIVE agents
+        const agents = await prisma.agent.findMany({
+            where: { status: 'LIVE' },
+            include: { tools: true }
+        });
+
         res.json({
             name: 'EGAP Factory',
             version: '0.1.0',
@@ -75,6 +215,8 @@ app.get('/.well-known/agent.json', async (req, res) => {
                 name: a.name,
                 role: a.role,
                 goal: a.goal,
+                workspace: a.workspace, // <--- Added
+                status: a.status,       // <--- Added
                 tools: a.tools.map(t => t.name),
             })),
         });

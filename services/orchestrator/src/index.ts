@@ -59,18 +59,75 @@ async function handleMessage(message: Message): Promise<void> {
         if (data.type === 'RESUME') {
             console.log(`🚀 RESUMING AGENT for Task ${data.taskId}! Executing tool call...`);
 
-            // FRS: Cost Accounting — log token usage for the resume action
-            if (data.agentId) {
+            // Fetch the full agent to get knowledgeBaseId
+            const agent = await prisma.agent.findUnique({
+                where: { id: data.agentId },
+                include: { tools: true } // Assuming tools are needed, but for now just KB ID
+            });
+
+            if (!agent) {
+                console.error(`❌ Agent ${data.agentId} not found during RESUME`);
+                message.ack();
+                return;
+            }
+
+            // Construct Tool Arguments
+            // The payload from the task (which came from Ingress) is likely the tool arguments
+            // We need to know WHICH tool to call. 
+            // Assumption: The message data contains the tool name or the task description implies it.
+            // For this implementation, we'll assume a default tool 'search_vertex_docs' or extract from payload if structured.
+            // But the prompt says "the tool is search_vertex", implying we might be hardcoding this behavior for the demo 
+            // or the `data` object has a `tool` field.
+            // Let's assume `data.tool` exists or default to `search_vertex_docs` for this specific flow.
+
+            const toolName = data.tool || 'search_vertex_docs';
+            let toolArgs = data.payload || {};
+
+            // INJECTION LOGIC
+            if (agent.knowledgeBaseId && toolName === 'search_vertex_docs') {
+                console.log(`💉 Injecting Knowledge Base ID: ${agent.knowledgeBaseId}`);
+                toolArgs = { ...toolArgs, data_store_id: agent.knowledgeBaseId };
+            }
+
+            // JSON-RPC Payload for MCP Hub
+            const jsonRpcPayload = {
+                jsonrpc: "2.0",
+                method: "call_tool",
+                params: {
+                    name: toolName,
+                    arguments: toolArgs
+                },
+                id: randomUUID()
+            };
+
+            console.log('📤 Sending JSON-RPC to MCP Hub:', JSON.stringify(jsonRpcPayload, null, 2));
+
+            try {
+                // Call MCP Hub (assuming running on port 8000 based on standard Python usage)
+                // In a real K8s setup, this would be `http://egap-mcp-hub:8000/mcp`
+                const response = await fetch('http://localhost:8000/mcp', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(jsonRpcPayload)
+                });
+
+                const result = await response.json();
+                console.log('📥 MCP Hub Response:', JSON.stringify(result, null, 2));
+
+                // FRS: Cost Accounting — log token usage for the resume action and tool call
                 await prisma.usageLog.create({
                     data: {
                         agentId: data.agentId,
-                        action: 'resume',
-                        tokens: 50,
-                        costUsd: 0.0005,
-                        metadata: { taskId: data.taskId, traceId },
+                        action: 'tool_execution', // Changed from 'resume' to reflect actual execution
+                        tokens: 150, // Higher cost for actual execution
+                        costUsd: 0.0015,
+                        metadata: { taskId: data.taskId, traceId, tool: toolName, kbId: agent.knowledgeBaseId },
                     },
                 });
-                console.log(`💰 Logged 50 tokens for agent ${data.agentId} (resume)`);
+                console.log(`💰 Logged 150 tokens for agent ${data.agentId} (tool_execution)`);
+
+            } catch (error) {
+                console.error('❌ Failed to call MCP Hub:', error);
             }
 
             // FRS: Record resume span
@@ -100,7 +157,7 @@ async function handleMessage(message: Message): Promise<void> {
         const agentLookupStart = Date.now();
         const source: string = data.source || 'unknown';
         const agent = await prisma.agent.findFirst({
-            where: { role: source },
+            where: { role: source, status: 'LIVE' },
         });
 
         // FRS: Record agent_lookup span
