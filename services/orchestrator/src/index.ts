@@ -455,7 +455,7 @@ async function handleMessage(message: Message): Promise<void> {
                 where: { key: 'emergency_stop' }
             });
 
-            if (globalSettings?.value?.active === true) {
+            if ((globalSettings?.value as any)?.active === true) {
                 console.error('🛑 SAFETY TRIGGER: System is in EMERGENCY STOP mode. Dropping message.');
                 // We Ack it to remove it from queue so it doesn't loop. 
                 // Alternatively we could Nack if we want to process it *after* stop is lifted, 
@@ -505,7 +505,7 @@ async function handleMessage(message: Message): Promise<void> {
                     maxOutputTokens: 1000,
                 },
                 history: chatHistory,
-                tools: tools, // Inject Tools
+                tools: tools as any, // Inject Tools
                 toolConfig: {
                     functionCallingConfig: {
                         mode: 'ANY',
