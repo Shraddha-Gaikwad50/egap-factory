@@ -42,7 +42,7 @@ interface Task {
 function App() {
     // State: UI
     const [activeTab, setActiveTab] = useState<'create' | 'test' | 'govern' | 'observe'>('create');
-    const [loading, setLoading] = useState(true);
+    const [_loading, setLoading] = useState(true);
     const [successMessage, setSuccessMessage] = useState('');
     const [errorMessage, setErrorMessage] = useState('');
 
@@ -224,8 +224,8 @@ function App() {
                     <button
                         onClick={toggleEmergency}
                         className={`px-6 py-3 rounded-xl font-bold border-2 transition-all shadow-xl flex items-center gap-2 ${emergencyActive
-                                ? 'bg-red-600 border-red-400 animate-pulse text-white'
-                                : 'bg-gray-800 border-gray-600 text-gray-400 hover:border-red-500 hover:text-red-400'
+                            ? 'bg-red-600 border-red-400 animate-pulse text-white'
+                            : 'bg-gray-800 border-gray-600 text-gray-400 hover:border-red-500 hover:text-red-400'
                             }`}
                     >
                         {emergencyActive ? '🛑 EMERGENCY STOP ACTIVE' : '🚨 Emergency Stop'}
@@ -245,8 +245,8 @@ function App() {
                                 key={tab.id}
                                 onClick={() => setActiveTab(tab.id as any)}
                                 className={`px-6 py-2 rounded-lg text-sm font-medium transition-all ${activeTab === tab.id
-                                        ? 'bg-purple-600 text-white shadow-lg'
-                                        : 'text-gray-400 hover:text-white hover:bg-gray-700'
+                                    ? 'bg-purple-600 text-white shadow-lg'
+                                    : 'text-gray-400 hover:text-white hover:bg-gray-700'
                                     }`}
                             >
                                 {tab.label}
