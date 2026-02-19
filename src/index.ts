@@ -3,11 +3,16 @@ import cors from 'cors';
 import path from 'path';
 import dotenv from 'dotenv';
 import { PrismaClient } from '@prisma/client';
+import { PubSub } from '@google-cloud/pubsub';
+import { randomUUID } from 'crypto';
+import { AgentSchema } from './validation';
 
 dotenv.config();
 
 const app = express();
 const prisma = new PrismaClient();
+const pubsub = new PubSub({ projectId: process.env.PROJECT_ID });
+const TOPIC_NAME = process.env.TOPIC_NAME || 'egap-ingress-topic';
 const PORT = Number(process.env.PORT) || 8080;
 
 // Middleware
@@ -36,7 +41,17 @@ app.get('/api/tools', async (req, res) => {
 // POST /api/agents - Create a new agent
 app.post('/api/agents', async (req, res) => {
     try {
-        const { name, role, goal, systemPrompt, tools } = req.body;
+        // Validate input
+        const validationResult = AgentSchema.safeParse(req.body);
+
+        if (!validationResult.success) {
+            return res.status(400).json({
+                error: 'Validation failed',
+                details: validationResult.error.format()
+            });
+        }
+
+        const { name, role, goal, systemPrompt, tools } = validationResult.data;
 
         const agent = await prisma.agent.create({
             data: {
@@ -84,8 +99,71 @@ app.get('/.well-known/agent.json', async (req, res) => {
     }
 });
 
-// POST /api/deploy — Trigger Cloud Build to deploy the factory to Cloud Run
-app.post('/api/deploy', async (req, res) => {
+// ─── Chat Endpoints ──────────────────────────────────────────────────
+
+// Send a message to an agent
+app.post('/api/chat', async (req, res) => {
+    try {
+        const { agentId, message } = req.body;
+
+        if (!agentId || !message) {
+            res.status(400).json({ error: 'agentId and message are required' });
+            return;
+        }
+
+        // 1. Save User Message
+        const userMsg = await prisma.message.create({
+            data: {
+                agentId,
+                role: 'user',
+                content: message,
+            },
+        });
+
+        // 2. Publish to Pub/Sub for the Brain
+        const topic = pubsub.topic(TOPIC_NAME);
+        const payload = {
+            type: 'CHAT',
+            agentId,
+            message,
+            traceId: randomUUID(), // Start a new trace
+        };
+
+        await topic.publishMessage({
+            data: Buffer.from(JSON.stringify(payload)),
+            attributes: {
+                source: 'api',
+                traceId: payload.traceId,
+            },
+        });
+
+        console.log(`📨 Sent CHAT signal for Agent ${agentId} to topic ${TOPIC_NAME}`);
+        res.json({ status: 'queued', messageId: userMsg.id });
+    } catch (error) {
+        console.error('Error sending message:', error);
+        res.status(500).json({ error: 'Failed to send message' });
+    }
+});
+
+// Get chat history for an agent
+app.get('/api/agents/:id/messages', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const messages = await prisma.message.findMany({
+            where: { agentId: id },
+            orderBy: { createdAt: 'asc' }, // Oldest first for chat UI
+        });
+        res.json(messages);
+    } catch (error) {
+        console.error('Error fetching messages:', error);
+        res.status(500).json({ error: 'Failed to fetch messages' });
+    }
+});
+
+// POST /api/system/update — Trigger Cloud Build to update the Factory Worker Pool
+// Note: In the "Shared Runtime" model, we update the entire platform at once,
+// rather than deploying individual services for each agent.
+app.post('/api/system/update', async (req, res) => {
     try {
         const { exec } = await import('child_process');
         const projectId = process.env.PROJECT_ID || 'gls-training-486405';

@@ -12,7 +12,7 @@ async function main() {
             systemPrompt: 'You are a DevOps expert.',
         },
     });
-    console.log(`✅ Upserted agent: ${agent.name} (Role: ${agent.role})`);
+    console.log(`✅ Upserted agent: ${agent.name} (ID: ${agent.id})`);
 }
 
 main()

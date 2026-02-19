@@ -1,7 +1,7 @@
 import Fastify from 'fastify';
 import { PubSub } from '@google-cloud/pubsub';
 import { PrismaClient } from '@prisma/client';
-import { randomUUID } from 'crypto';
+import { randomUUID, createHash } from 'crypto';
 import dotenv from 'dotenv';
 
 // ── Config ───────────────────────────────────────────────────────────
@@ -64,11 +64,39 @@ fastify.post<{ Body: WebhookBody }>('/webhook', async (request, reply) => {
     // FRS: Increment audit counter
     auditCounters.totalReceived++;
 
-    // FRS: Generate traceId for this request flow
-    const traceId = randomUUID();
-
     const source: string = body.source || 'unknown';
     const payload: Record<string, unknown> = body.payload || body;
+
+    // ── IDEMPOTENCY CHECK ────────────────────────────────────────────────
+    // Generate SHA-256 hash of the payload to detect duplicates
+    const payloadString = JSON.stringify(payload);
+    const idempotencyKey = createHash('sha256').update(payloadString).digest('hex');
+
+    // Check if we have already processed this payload recently
+    // We check TraceSpans where operation='webhook_receive' and metadata contains this hash
+    const existingSpan = await prisma.traceSpan.findFirst({
+        where: {
+            operation: 'webhook_receive',
+            metadata: {
+                path: ['idempotencyKey'],
+                equals: idempotencyKey
+            }
+        }
+    });
+
+    if (existingSpan) {
+        fastify.log.warn({ traceId: existingSpan.traceId, idempotencyKey }, '⚠️ Duplicate payload detected. Skipping.');
+        return reply.status(200).send({
+            status: 'duplicate',
+            originalTraceId: existingSpan.traceId,
+            message: 'Payload already processed',
+            idempotencyKey
+        });
+    }
+    // ─────────────────────────────────────────────────────────────────────
+
+    // FRS: Generate traceId for this request flow
+    const traceId = randomUUID();
 
     // FRS: Record root span for webhook receive
     const rootSpanId = randomUUID();
@@ -78,7 +106,7 @@ fastify.post<{ Body: WebhookBody }>('/webhook', async (request, reply) => {
             traceId,
             service: 'ingress',
             operation: 'webhook_receive',
-            metadata: { source },
+            metadata: { source, idempotencyKey }, // Store hash for future checks
         },
     });
 
@@ -127,6 +155,7 @@ fastify.post<{ Body: WebhookBody }>('/webhook', async (request, reply) => {
             status: 'queued',
             messageId,
             traceId,
+            idempotencyKey
         });
     } catch (err) {
         auditCounters.totalFailed++;

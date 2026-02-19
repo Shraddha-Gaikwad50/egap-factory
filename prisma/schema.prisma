@@ -24,6 +24,7 @@ model Agent {
   deployments  Deployment[]
   tasks        Task[]
   usageLogs    UsageLog[]
+  messages     Message[]
   createdAt    DateTime     @default(now())
   updatedAt    DateTime     @updatedAt
 }
@@ -55,7 +56,9 @@ model Task {
   inputPayload Json?
   agent        Agent    @relation(fields: [agentId], references: [id])
   agentId      String
+  traceId      String?  // For Reconciliation: Link to Ingress Trace
   createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 }
 
 // UsageLog model - FRS Cost Accounting: per-agent token tracking
@@ -83,4 +86,24 @@ model TraceSpan {
   startedAt   DateTime @default(now())
 
   @@index([traceId])
+}
+
+// Message model - represents chat history for Test Flight
+model Message {
+  id        String   @id @default(uuid())
+  role      String   // 'user' | 'assistant'
+  content   String   // @db.Text is not needed in Postgres for unlimited text usually, but keeping String is fine. Default String is text.
+  agent     Agent    @relation(fields: [agentId], references: [id])
+  agentId   String
+  tokens    Int      @default(0)
+  cost      Float    @default(0.0)
+  createdAt DateTime @default(now())
+}
+
+// GlobalSettings model - for System-wide flags like Emergency Stop
+model GlobalSettings {
+  id        String   @id @default(uuid())
+  key       String   @unique // e.g., 'emergency_stop'
+  value     Json     // e.g., { active: true, triggeredBy: 'admin', at: '...' }
+  updatedAt DateTime @updatedAt
 }

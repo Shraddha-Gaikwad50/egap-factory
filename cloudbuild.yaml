@@ -30,8 +30,10 @@ steps:
       - '--allow-unauthenticated'
       - '--add-cloudsql-instances'
       - '${PROJECT_ID}:us-central1:egap-db'
+      - '--set-secrets'
+      - 'DB_PASSWORD=egap-db-password:latest'
       - '--set-env-vars'
-      - 'DATABASE_URL=postgresql://postgres:egapproject@localhost:5432/factory_db,NODE_ENV=production'
+      - 'DB_USER=postgres,DB_NAME=postgres,DB_SOCKET_PATH=/cloudsql/${PROJECT_ID}:us-central1:egap-db,NODE_ENV=production'
 
 # Store images in Artifact Registry
 images:
