@@ -1,3 +1,4 @@
+#!/bin/sh
 # Construct DATABASE_URL using the injected DB_PASSWORD secret
 if [ -n "$DB_PASSWORD" ]; then
   echo "🔐 Constructing DATABASE_URL from secrets..."
