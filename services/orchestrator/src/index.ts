@@ -18,7 +18,7 @@ const SUBSCRIPTION_NAME = process.env.SUBSCRIPTION_NAME;
 const TOPIC_NAME = process.env.TOPIC_NAME;
 const LOCATION = 'asia-south1';
 const MODEL_NAME = 'gemini-2.5-flash';
-const PORT = 3000;
+const PORT = parseInt(process.env.PORT || '3000', 10);
 
 if (!SUBSCRIPTION_NAME || !TOPIC_NAME) {
     console.error('❌ Missing required env vars: SUBSCRIPTION_NAME and TOPIC_NAME must be set in .env');
