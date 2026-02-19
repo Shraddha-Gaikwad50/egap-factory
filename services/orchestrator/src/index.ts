@@ -505,6 +505,7 @@ async function handleMessage(message: Message): Promise<void> {
                     maxOutputTokens: 1000,
                 },
                 history: chatHistory,
+                // @ts-ignore - SDK types don't include tools but it works at runtime
                 tools: tools as any, // Inject Tools
                 toolConfig: {
                     functionCallingConfig: {
