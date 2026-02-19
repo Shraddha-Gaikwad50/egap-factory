@@ -54,6 +54,14 @@ app.register(fastifyStatic, {
     prefix: '/',
 });
 
+// SPA Fallback: Serve index.html for any 404 that isn't an API call
+app.setNotFoundHandler((req, reply) => {
+    if (req.method === 'GET' && !req.url.startsWith('/api')) {
+        return reply.sendFile('index.html');
+    }
+    reply.status(404).send({ error: 'Not Found', message: `Route ${req.method}:${req.url} not found` });
+});
+
 // ── Types ────────────────────────────────────────────────────────────
 interface AgentPayload {
     name: string;

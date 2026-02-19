@@ -33,6 +33,9 @@ RUN tsc -p tsconfig.json
 COPY client ./client
 RUN cd client && npm install && npm run build
 
+# Move build artifacts to public folder served by Fastify
+RUN mkdir -p public && cp -r client/dist/* public/ && rm -rf client
+
 # 8. Add Entrypoint script
 COPY entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/entrypoint.sh
