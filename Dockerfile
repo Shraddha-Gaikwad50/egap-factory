@@ -1,5 +1,5 @@
 # Single-stage build - run source directly with ts-node
-FROM node:18-slim
+FROM node:20-slim
 
 # Install system dependencies for Prisma and OpenSSL
 RUN apt-get update -y && apt-get install -y openssl ca-certificates python3 build-essential && rm -rf /var/lib/apt/lists/*
@@ -20,8 +20,8 @@ COPY prisma ./prisma
 COPY prisma.config.ts ./
 COPY services/orchestrator/tsconfig.json ./
 
-# 4. Generate Prisma Client
-RUN npx prisma generate
+# 4. Generate Prisma Client (dummy URL - generate only needs schema, not a real DB)
+RUN DATABASE_URL="postgresql://dummy:dummy@localhost:5432/dummy" npx prisma generate
 
 # 5. Copy Orchestrator Source Code
 COPY services/orchestrator/src ./src
