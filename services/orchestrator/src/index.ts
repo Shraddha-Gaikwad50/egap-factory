@@ -3,12 +3,14 @@ import Fastify from 'fastify';
 import fastifyCors from '@fastify/cors';
 import fastifyStatic from '@fastify/static';
 import { PubSub, Message } from '@google-cloud/pubsub';
+import { Storage } from '@google-cloud/storage';
 import { PrismaClient } from '@prisma/client';
 import { GoogleGenAI } from '@google/genai';
 import { randomUUID } from 'crypto';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import fastifyWebsocket from '@fastify/websocket';
 
 // ── Config ───────────────────────────────────────────────────────────
 dotenv.config();
@@ -32,6 +34,7 @@ const __dirname = path.dirname(__filename);
 // ── Clients ──────────────────────────────────────────────────────────
 const prisma = new PrismaClient();
 const pubsub = new PubSub({ projectId: PROJECT_ID });
+const storage = new Storage({ projectId: PROJECT_ID });
 const subscription = pubsub.subscription(SUBSCRIPTION_NAME);
 const topic = pubsub.topic(TOPIC_NAME);
 
@@ -52,6 +55,30 @@ app.register(fastifyCors, {
 app.register(fastifyStatic, {
     root: path.join(__dirname, '..', 'public'),
     prefix: '/',
+});
+
+// ── WebSockets ───────────────────────────────────────────────────────
+app.register(fastifyWebsocket);
+
+// Store active connections by agentId (or a unique session ID later)
+const activeConnections = new Map<string, any>();
+
+app.register(async function (fastify) {
+    // @ts-ignore
+    fastify.get('/ws', { websocket: true }, (connection, req) => {
+        const agentId = (req.query as any).agentId;
+        if (agentId) {
+            console.log(`🔌 WebSocket connected for agent: ${agentId}`);
+            activeConnections.set(agentId, connection);
+
+            connection.on('close', () => {
+                console.log(`🔌 WebSocket disconnected for agent: ${agentId}`);
+                activeConnections.delete(agentId);
+            });
+        } else {
+            connection.close();
+        }
+    });
 });
 
 // SPA Fallback: Serve index.html for any 404 that isn't an API call
@@ -76,18 +103,33 @@ interface ChatPayload {
     message: string;
 }
 
-// ── API Routes (The Factory Interface) ───────────────────────────────
-
 /**
  * GET /api/tools
- * Mock list of available tools (Phase 1 Stub integration)
+ * List all available tools from the database
  */
 app.get('/api/tools', async (_request, _reply) => {
-    return [
-        { id: 'search_vertex_docs', name: 'search_vertex_docs', description: 'Search Vertex AI Documentation' },
-        { id: 'send_email', name: 'send_email', description: 'Send an email via SMTP' },
-        { id: 'save_file', name: 'save_file', description: 'Save content to Cloud Storage' },
-    ];
+    return await prisma.tool.findMany();
+});
+
+/**
+ * POST /api/tools
+ * Create a new tool blueprint
+ */
+app.post<{ Body: { name: string, description: string, parameters: any } }>('/api/tools', async (request, reply) => {
+    const { name, description, parameters } = request.body;
+    try {
+        const tool = await prisma.tool.create({
+            data: {
+                name,
+                description,
+                configuration: { parameters }
+            }
+        });
+        return reply.status(201).send(tool);
+    } catch (err: any) {
+        app.log.error(err);
+        return reply.status(500).send({ error: 'Failed to create tool' });
+    }
 });
 
 /**
@@ -143,6 +185,59 @@ app.post<{ Body: AgentPayload }>('/api/agents', async (request, reply) => {
 });
 
 /**
+ * PUT /api/agents/:id
+ * Update an existing agent blueprint
+ */
+app.put<{ Params: { id: string }, Body: AgentPayload }>('/api/agents/:id', async (request, reply) => {
+    const { id } = request.params;
+    const { name, role, goal, systemPrompt, tools } = request.body;
+
+    try {
+        const agent = await prisma.agent.update({
+            where: { id },
+            data: {
+                name,
+                role,
+                goal,
+                systemPrompt,
+                tools: {
+                    set: [], // Clear existing relations
+                    connectOrCreate: tools.map((toolId) => ({
+                        where: { name: toolId },
+                        create: { name: toolId, description: 'Auto-created tool stub' },
+                    })),
+                },
+            },
+        });
+        return reply.send(agent);
+    } catch (err: any) {
+        app.log.error(err);
+        return reply.status(500).send({ error: 'Failed to update agent' });
+    }
+});
+
+/**
+ * DELETE /api/agents/:id
+ * Delete an agent blueprint and its relations
+ */
+app.delete<{ Params: { id: string } }>('/api/agents/:id', async (request, reply) => {
+    const { id } = request.params;
+    try {
+        // Must delete related records first
+        await prisma.message.deleteMany({ where: { agentId: id } });
+        await prisma.task.deleteMany({ where: { agentId: id } });
+        await prisma.usageLog.deleteMany({ where: { agentId: id } });
+        await prisma.deployment.deleteMany({ where: { agentId: id } });
+
+        await prisma.agent.delete({ where: { id } });
+        return { success: true };
+    } catch (err: any) {
+        app.log.error(err);
+        return reply.status(500).send({ error: 'Failed to delete agent' });
+    }
+});
+
+/**
  * POST /api/chat
  * Send a message to an agent via Pub/Sub (Triggering Orchestrator Worker)
  */
@@ -163,20 +258,29 @@ app.post<{ Body: ChatPayload }>('/api/chat', async (request, reply) => {
             },
         });
 
-        // Publish to Pub/Sub
-        const event = {
+        const traceId = randomUUID();
+
+        // Also publish to Pub/Sub for ingress tracking (fire-and-forget)
+        topic.publishMessage({
+            data: Buffer.from(JSON.stringify({ type: 'TRACE_ONLY', agentId, traceId })),
+        }).catch(() => { }); // Swallow errors — this is just for trace counting
+
+        // Process chat INLINE (not via Pub/Sub) — this is critical for Cloud Run
+        // which scales to zero and can't maintain a pull subscription
+        const chatData = {
             type: 'CHAT',
             agentId,
             message,
-            traceId: randomUUID(),
-            dbMessageId: userMsg.id, // Pass DB ID to worker
+            traceId,
+            dbMessageId: userMsg.id,
         };
 
-        const messageId = await topic.publishMessage({
-            data: Buffer.from(JSON.stringify(event)),
+        // Fire the processing as a background task (don't await — return 200 immediately)
+        processChat(chatData).catch(err => {
+            console.error('❌ Inline chat processing error:', err);
         });
 
-        return { status: 'sent', messageId, userMessage: userMsg };
+        return { status: 'sent', messageId: traceId, userMessage: userMsg };
     } catch (err) {
         app.log.error(err);
         return reply.status(500).send({ error: 'Failed to process chat' });
@@ -194,6 +298,21 @@ app.get<{ Params: { id: string } }>('/api/agents/:id/messages', async (request, 
         orderBy: { createdAt: 'asc' },
     });
     return messages;
+});
+
+/**
+ * DELETE /api/agents/:id/messages
+ * Clear chat history for an agent
+ */
+app.delete<{ Params: { id: string } }>('/api/agents/:id/messages', async (request, reply) => {
+    const { id } = request.params;
+    try {
+        await prisma.message.deleteMany({ where: { agentId: id } });
+        return { success: true };
+    } catch (err) {
+        app.log.error(err);
+        return reply.status(500).send({ error: 'Failed to clear chat history' });
+    }
 });
 
 // ── COMMAND PLANE API ────────────────────────────────────────────────
@@ -299,12 +418,29 @@ app.get('/api/dashboard/stats', async (_req, _rep) => {
         take: 50
     });
 
+    // 3. Per-Agent Cost Breakdown
+    const agentCosts = await prisma.usageLog.groupBy({
+        by: ['agentId'],
+        _sum: { costUsd: true, tokens: true },
+        _count: { id: true }
+    });
+    const allAgents = await prisma.agent.findMany({ select: { id: true, name: true } });
+    const agentMap = new Map(allAgents.map(a => [a.id, a.name]));
+    const perAgentCosts = agentCosts.map((ac: any) => ({
+        agentId: ac.agentId,
+        agentName: agentMap.get(ac.agentId) || 'Unknown',
+        totalCost: ac._sum.costUsd || 0,
+        totalTokens: ac._sum.tokens || 0,
+        invocations: ac._count.id || 0
+    }));
+
     return {
         totalCost,
         activeAgents,
         pendingTasks,
         zombieCount,
-        traces
+        traces,
+        perAgentCosts
     };
 });
 
@@ -361,42 +497,230 @@ app.get('/api/reports/reconciliation', async (_req, _rep) => {
 });
 
 
-// ── Tool Definitions ─────────────────────────────────────────────────
-const tools = [
-    {
-        functionDeclarations: [ // camelCase for SDK
-            {
-                name: "search_vertex_docs",
-                description: "Search the Vertex AI documentation for technical information.",
-                parameters: {
-                    type: "OBJECT",
-                    properties: {
-                        query: { type: "STRING", description: "The search query." }
-                    },
-                    required: ["query"]
-                }
+
+// ── Extracted Chat Processor (Shared by HTTP handler and Pub/Sub worker) ──
+async function processChat(data: { type: string; agentId: string; message: string; traceId: string; dbMessageId?: string }): Promise<void> {
+    const startTimeMs = Date.now();
+    let opStatus = 'OK';
+
+    try {
+        // ── SAFETY CHECK: Emergency Stop ──────────────────────────────
+        const globalSettings = await prisma.globalSettings.findUnique({
+            where: { key: 'emergency_stop' }
+        });
+
+        if ((globalSettings?.value as any)?.active === true) {
+            console.error('🛑 SAFETY TRIGGER: System is in EMERGENCY STOP mode. Dropping message.');
+            return;
+        }
+
+        const agentId = data.agentId;
+        console.log(`🧠 Processing CHAT message for Agent ${agentId} (Model: ${MODEL_NAME})`);
+
+        const agent = await prisma.agent.findUnique({
+            where: { id: agentId },
+            include: { tools: true }
+        });
+
+        if (!agent) {
+            console.error(`❌ Agent ${agentId} not found`);
+            return;
+        }
+
+        // Fetch conversation history
+        const history = await prisma.message.findMany({
+            where: { agentId },
+            orderBy: { createdAt: 'desc' },
+            take: 10
+        });
+
+        const chatHistory = history.reverse().map((msg: any) => ({
+            role: msg.role === 'admin' ? 'user' : (msg.role === 'user' ? 'user' : 'model'),
+            parts: [{ text: msg.content }]
+        }));
+
+        // ── BUDGET GUARDRAIL ─────────────────────────────────────────
+        const allMessages = await prisma.message.findMany({
+            where: { agentId },
+            select: { cost: true }
+        });
+        const currentSpend = allMessages.reduce((sum: number, msg: any) => sum + (msg.cost || 0), 0);
+        const MAX_BUDGET = 5.00;
+
+        if (currentSpend >= MAX_BUDGET) {
+            console.error(`🛑 BUDGET LIMIT: Agent ${agentId} spent $${currentSpend.toFixed(4)} (Limit: $${MAX_BUDGET.toFixed(2)})`);
+            await prisma.message.create({
+                data: { agentId, role: 'assistant', content: `[System Error] 🛑 Agent budget limit reached ($${currentSpend.toFixed(4)} / $${MAX_BUDGET.toFixed(2)}). Execution blocked.` }
+            });
+            return;
+        }
+
+        // ── DYNAMIC TOOL COMPILATION ─────────────────────────────────
+        const dynamicFunctionDeclarations = agent.tools.map((t: any) => {
+            const config: any = t.configuration;
+            return { name: t.name, description: t.description, parameters: config?.parameters || {} };
+        });
+
+        const dynamicTools = dynamicFunctionDeclarations.length > 0 ? [{ functionDeclarations: dynamicFunctionDeclarations }] : [];
+        const allowedFunctionNames = agent.tools.map((t: any) => t.name);
+
+        // Start Chat Session (STREAMING)
+        const chat = genAI.chats.create({
+            model: MODEL_NAME,
+            config: {
+                systemInstruction: {
+                    parts: [
+                        { text: agent.systemPrompt },
+                        { text: "CRITICAL: You are an agent with access to function calling tools. You must use valid function calls. DO NOT generate Python code or usage of `print()`. Use the tools provided directly." }
+                    ]
+                },
+                maxOutputTokens: 1000,
             },
-            {
-                name: "send_email",
-                description: "Send an email to a recipient. REQUIRES HUMAN APPROVAL.",
-                parameters: {
-                    type: "OBJECT",
-                    properties: {
-                        recipient: { type: "STRING", description: "Email address of recipient." },
-                        subject: { type: "STRING", description: "Subject line." },
-                        body: { type: "STRING", description: "Email body content." }
-                    },
-                    required: ["recipient", "subject", "body"]
+            history: chatHistory,
+            // @ts-ignore
+            tools: dynamicTools as any,
+            toolConfig: dynamicFunctionDeclarations.length > 0 ? {
+                functionCallingConfig: { mode: 'ANY', allowedFunctionNames }
+            } : undefined
+        });
+
+        console.log(`🤖 Sending streaming message to Vertex AI...`);
+
+        // @ts-ignore
+        const streamResult = await chat.sendMessageStream({ message: data.message });
+
+        let fullResponseText = "";
+        let usageMetadata: any = null;
+        let finalCandidate: any = null;
+        const wsSocket = activeConnections.get(agentId);
+
+        // @ts-ignore
+        for await (const chunk of streamResult) {
+            // @ts-ignore
+            const chunkCandidates = chunk.candidates || chunk.response?.candidates;
+            const chunkText = chunkCandidates?.[0]?.content?.parts?.[0]?.text;
+
+            if (chunkText) {
+                fullResponseText += chunkText;
+                if (wsSocket) {
+                    wsSocket.send(JSON.stringify({ type: 'thought_chunk', text: chunkText }));
                 }
             }
-        ]
+
+            if (chunk.usageMetadata !== undefined) usageMetadata = chunk.usageMetadata;
+            // @ts-ignore
+            else if (chunk.response?.usageMetadata !== undefined) usageMetadata = chunk.response.usageMetadata;
+            if (chunkCandidates?.[0]) finalCandidate = chunkCandidates[0];
+        }
+
+        const result = { usageMetadata, candidates: finalCandidate ? [finalCandidate] : [] };
+
+        // ── COST ACCOUNTING ──────────────────────────────────────────
+        const usage = result.usageMetadata;
+        const inputTokens = usage?.promptTokenCount || 0;
+        const outputTokens = usage?.candidatesTokenCount || 0;
+        const totalTokens = usage?.totalTokenCount || 0;
+        const cost = (inputTokens * 0.00001875 / 1000) + (outputTokens * 0.000075 / 1000);
+        console.log(`💰 Cost: $${cost.toFixed(6)} (${totalTokens} tokens)`);
+
+        if (data.dbMessageId) {
+            await prisma.message.update({
+                where: { id: data.dbMessageId },
+                data: { tokens: totalTokens, cost }
+            });
+        }
+
+        // ── RESPONSE HANDLING ────────────────────────────────────────
+        // @ts-ignore
+        const candidates = result.candidates || result.response?.candidates;
+        const firstCandidate = candidates?.[0];
+        let firstPart = firstCandidate?.content?.parts?.[0];
+
+        // 🚨 FALLBACK: Handle UNEXPECTED_TOOL_CALL
+        if (firstCandidate?.finishReason === 'UNEXPECTED_TOOL_CALL' && firstCandidate?.finishMessage) {
+            const rawMsg = firstCandidate.finishMessage;
+            const match = rawMsg.match(/print\(([\w_]+)\((.*)\)\)/);
+            if (match) {
+                const fnName = match[1];
+                const argsStr = match[2];
+                const args: any = {};
+                const argMatches = argsStr.matchAll(/(\w+)=['"]([\s\S]*?)['"]/g);
+                for (const m of argMatches) { args[m[1]] = m[2]; }
+                firstPart = { functionCall: { name: fnName, args } };
+            }
+        }
+
+        // ── FUNCTION CALLING ─────────────────────────────────────────
+        // @ts-ignore
+        if (firstPart?.functionCall) {
+            const fn = firstPart.functionCall;
+            console.log(`⚡️ Agent wants to call tool: ${fn.name}`);
+
+            if (fn.name === 'send_email') {
+                const task = await prisma.task.create({
+                    data: { description: `Agent wants to send email to ${fn.args.recipient}`, status: 'PENDING', agentId: agent.id, inputPayload: fn.args, traceId: data.traceId || null }
+                });
+                await prisma.message.create({ data: { agentId: agent.id, role: 'assistant', content: `[System] Usage of tool '${fn.name}' requires Admin Approval. Task ${task.id} created.`, tokens: totalTokens, cost } });
+                await prisma.usageLog.create({ data: { agentId: agent.id, action: `tool_intercept_${fn.name}`, tokens: totalTokens, costUsd: cost } });
+                console.log(`🔒 Task ${task.id} created. Suspending execution.`);
+                return;
+            }
+
+            if (fn.name === 'search_vertex_docs') {
+                const output = `Found docs for query '${fn.args.query}': Vertex AI is Google's fully managed AI platform...`;
+                await prisma.message.create({ data: { agentId: agent.id, role: 'assistant', content: `(Tool: ${fn.name}) ${output}`, tokens: totalTokens, cost } });
+                await prisma.usageLog.create({ data: { agentId: agent.id, action: `tool_execute_${fn.name}`, tokens: totalTokens, costUsd: cost } });
+                return;
+            }
+
+            if (fn.name === 'save_file') {
+                const bucketName = `${PROJECT_ID}_cloudbuild`;
+                try {
+                    await storage.bucket(bucketName).file(fn.args.filename).save(fn.args.content);
+                    await prisma.message.create({ data: { agentId: agent.id, role: 'assistant', content: `(Tool: ${fn.name}) Successfully saved ${fn.args.filename} to GCS.`, tokens: totalTokens, cost } });
+                    await prisma.usageLog.create({ data: { agentId: agent.id, action: `tool_execute_${fn.name}`, tokens: totalTokens, costUsd: cost } });
+                } catch (err: any) {
+                    await prisma.message.create({ data: { agentId: agent.id, role: 'assistant', content: `(Tool Error: ${fn.name}) ${err.message}`, tokens: totalTokens, cost } });
+                    await prisma.usageLog.create({ data: { agentId: agent.id, action: `tool_error_${fn.name}`, tokens: totalTokens, costUsd: cost } });
+                }
+                return;
+            }
+        }
+
+        // Normal Text Response
+        const responseText = firstPart?.text || "I'm sorry, I couldn't generate a response.";
+        console.log(`✅ Vertex Response: ${responseText.substring(0, 50)}...`);
+        await prisma.message.create({ data: { agentId: agent.id, role: 'assistant', content: responseText, tokens: totalTokens, cost } });
+        await prisma.usageLog.create({ data: { agentId: agent.id, action: 'llm_inference', tokens: totalTokens, costUsd: cost } });
+
+    } catch (err: any) {
+        opStatus = 'ERROR';
+        console.error('❌ processChat error:', err);
+        throw err;
+    } finally {
+        if (data.traceId) {
+            await prisma.traceSpan.create({
+                data: { traceId: data.traceId, service: 'orchestrator', operation: 'chat_completion', status: opStatus, durationMs: Date.now() - startTimeMs }
+            }).catch((e: any) => console.error('Failed to log TraceSpan:', e));
+        }
     }
-];
+}
+
+
 
 // ── Worker Handler (The Brain) ───────────────────────────────────────
 async function handleMessage(message: Message): Promise<void> {
+    const startTimeMs = Date.now();
+    let traceId: string | null = null;
+    let opStatus = 'OK';
+    let operationName = 'process_message';
+
     try {
         const data = JSON.parse(message.data.toString());
+        traceId = data.traceId || null;
+        if (data.type === 'RESUME') operationName = 'resume_task';
+        if (data.type === 'CHAT') operationName = 'chat_completion';
+
         console.log(`📩 Received message ${message.id} (${data.type})`);
 
         // ── RESUME SIGNAL (From HITL Approval) ────────────────────────
@@ -458,217 +782,7 @@ async function handleMessage(message: Message): Promise<void> {
         }
 
         if (data.type === 'CHAT') {
-            // ── SAFETY CHECK: Emergency Stop ──────────────────────────────
-            const globalSettings = await prisma.globalSettings.findUnique({
-                where: { key: 'emergency_stop' }
-            });
-
-            if ((globalSettings?.value as any)?.active === true) {
-                console.error('🛑 SAFETY TRIGGER: System is in EMERGENCY STOP mode. Dropping message.');
-                // We Ack it to remove it from queue so it doesn't loop. 
-                // Alternatively we could Nack if we want to process it *after* stop is lifted, 
-                // but "Emergency Stop" usually means "Kill everything now".
-                // Let's Ack and maybe log a "Cancelled" status in DB if possible.
-                message.ack();
-                return;
-            }
-            // ─────────────────────────────────────────────────────────────
-
-            const agentId = data.agentId;
-            console.log(`🧠 Processing CHAT message for Agent ${agentId} (Model: ${MODEL_NAME})`);
-
-            const agent = await prisma.agent.findUnique({
-                where: { id: agentId },
-                include: { tools: true }
-            });
-
-            if (!agent) {
-                console.error(`❌ Agent ${agentId} not found`);
-                message.ack();
-                return;
-            }
-
-            // Fetch conversation history
-            const history = await prisma.message.findMany({
-                where: { agentId: agentId },
-                orderBy: { createdAt: 'desc' },
-                take: 10 // Limit context
-            });
-
-            const chatHistory = history.reverse().map(msg => ({
-                role: msg.role === 'admin' ? 'user' : (msg.role === 'user' ? 'user' : 'model'),
-                parts: [{ text: msg.content }]
-            }));
-
-            // Start Chat Session
-            const chat = genAI.chats.create({
-                model: MODEL_NAME,
-                config: {
-                    systemInstruction: {
-                        parts: [
-                            { text: agent.systemPrompt },
-                            { text: "CRITICAL: You are an agent with access to function calling tools. You must use valid function calls. DO NOT generate Python code or usage of `print()`. Use the tools provided directly." }
-                        ]
-                    },
-                    maxOutputTokens: 1000,
-                },
-                history: chatHistory,
-                // @ts-ignore - SDK types don't include tools but it works at runtime
-                tools: tools as any, // Inject Tools
-                toolConfig: {
-                    functionCallingConfig: {
-                        mode: 'ANY',
-                        allowedFunctionNames: ['send_email', 'search_vertex_docs']
-                    }
-                }
-            });
-
-            console.log(`🤖 Sending message to Vertex AI...`);
-
-            // @ts-ignore
-            const result = await chat.sendMessage({
-                message: data.message
-            });
-
-            console.log('----- DEBUG RESULT -----');
-            console.log(JSON.stringify(result, null, 2));
-            console.log('------------------------');
-
-            // ── COST ACCOUNTING ──────────────────────────────────────────
-            // @ts-ignore
-            const usage = result.usageMetadata;
-            const inputTokens = usage?.promptTokenCount || 0;
-            const outputTokens = usage?.candidatesTokenCount || 0;
-            const totalTokens = usage?.totalTokenCount || 0;
-
-            // Gemini 1.5 Flash Pricing (Approx)
-            const cost = (inputTokens * 0.00001875 / 1000) + (outputTokens * 0.000075 / 1000); // 1.5 Flash < 128k context
-            console.log(`💰 Cost: $${cost.toFixed(6)} (${totalTokens} tokens)`);
-
-            // Save Cost to Message
-            if (data.dbMessageId) {
-                await prisma.message.update({
-                    where: { id: data.dbMessageId },
-                    data: {
-                        tokens: totalTokens,
-                        cost: cost
-                    }
-                });
-            } else {
-                console.warn('⚠️ No dbMessageId in payload, skipping cost update.');
-            }
-
-            // ── RESPONSE HANDLING ────────────────────────────────────────
-            // @ts-ignore
-            const candidates = result.candidates || result.response?.candidates;
-            const firstCandidate = candidates?.[0];
-            let firstPart = firstCandidate?.content?.parts?.[0];
-
-            // 🚨 FALLBACK: Handle UNEXPECTED_TOOL_CALL (Gemini 2.5 Flash Python Output)
-            if (firstCandidate?.finishReason === 'UNEXPECTED_TOOL_CALL' && firstCandidate?.finishMessage) {
-                console.log('⚠️ Handling UNEXPECTED_TOOL_CALL fallback...');
-                const rawMsg = firstCandidate.finishMessage;
-                // Expected format: "Unexpected tool call: print(send_email(recipient='...', ...))"
-                // Regex to extract function name and args string
-                const match = rawMsg.match(/print\(([\w_]+)\((.*)\)\)/);
-                if (match) {
-                    const fnName = match[1];
-                    const argsStr = match[2];
-
-                    // Simple heuristic parser for python-style kwargs (recipient='val', subject='val')
-                    // This is brittle but necessary for the 2.5 Flash behavior
-                    const args: any = {};
-                    const argMatches = argsStr.matchAll(/(\w+)=['"]([^'"]*)['"]/g);
-                    for (const m of argMatches) {
-                        args[m[1]] = m[2];
-                    }
-
-                    console.log(`🔧 Parsed Fallback Function Call: ${fnName}`, args);
-
-                    // Mock the functionCall object so the loop below handles it
-                    firstPart = {
-                        functionCall: {
-                            name: fnName,
-                            args: args
-                        }
-                    };
-                }
-            }
-
-            // ── FUNCTION CALLING LOOP ────────────────────────────────────
-            // @ts-ignore
-            if (firstPart?.functionCall) {
-                const fn = firstPart.functionCall;
-                console.log(`⚡️ Agent wants to call tool: ${fn.name}`);
-
-                // HITL CHECK for 'send_email'
-                if (fn.name === 'send_email') {
-                    console.log(`✋ HIGH RISK ACTION INTERCEPTED: ${fn.name}`);
-
-                    // Create Pending Task
-                    const task = await prisma.task.create({
-                        data: {
-                            description: `Agent wants to send email to ${fn.args.recipient}`,
-                            status: 'PENDING',
-                            agentId: agent.id,
-                            inputPayload: fn.args, // Save args to execute later
-                            traceId: data.traceId || null // Link to ingress trace
-                        }
-                    });
-
-                    // Save 'Assistant' message indicating hold
-                    await prisma.message.create({
-                        data: {
-                            agentId: agent.id,
-                            role: 'assistant',
-                            content: `[System] Usage of tool '${fn.name}' requires Admin Approval. Task ${task.id} created.`,
-                            tokens: totalTokens,
-                            cost: cost
-                        }
-                    });
-
-                    console.log(`🔒 Task ${task.id} created. Suspending execution.`);
-                    message.ack();
-                    return;
-                }
-
-                // Execute SAFE tools immediately
-                if (fn.name === 'search_vertex_docs') {
-                    // Mock execution
-                    const output = `Found docs for query '${fn.args.query}': Vertex AI is Google's fully managed AI platform...`;
-                    console.log(`✅ Auto-executed Safe Tool: ${fn.name}`);
-
-                    // 🔄 RECURSION: Send tool output back to model
-                    // In a real loop we'd call sendMessage again with functionResponse.
-                    // For this demo, we'll just save the output as a message to move forward.
-                    await prisma.message.create({
-                        data: {
-                            agentId: agent.id,
-                            role: 'assistant',
-                            content: `(Tool: ${fn.name}) ${output}`,
-                            tokens: totalTokens,
-                            cost: cost
-                        }
-                    });
-                    message.ack();
-                    return;
-                }
-            }
-
-            // Normal Text Response
-            const responseText = firstPart?.text || "I'm sorry, I couldn't generate a response.";
-            console.log(`✅ Vertex Response: ${responseText.substring(0, 50)}...`);
-
-            await prisma.message.create({
-                data: {
-                    agentId: agent.id,
-                    role: 'assistant',
-                    content: responseText,
-                    tokens: totalTokens,
-                    cost: cost
-                }
-            });
-
+            await processChat(data);
             message.ack();
             return;
         }
@@ -677,8 +791,21 @@ async function handleMessage(message: Message): Promise<void> {
         message.ack();
 
     } catch (err: any) {
+        opStatus = 'ERROR';
         console.error(`⚠️  Error processing message:`, err);
         message.nack(); // Retry on error
+    } finally {
+        if (traceId) {
+            await prisma.traceSpan.create({
+                data: {
+                    traceId,
+                    service: 'orchestrator',
+                    operation: operationName,
+                    status: opStatus,
+                    durationMs: Date.now() - startTimeMs
+                }
+            }).catch(e => console.error('Failed to log TraceSpan:', e));
+        }
     }
 }
 
