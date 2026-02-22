@@ -11,5 +11,9 @@ if [ -n "$DB_PASSWORD" ]; then
   fi
 fi
 
+# Run Prisma migrations in production
+echo "📦 Running Prisma migrations..."
+npx prisma migrate deploy || echo "⚠️ Migration failed or already applied"
+
 # Run the passed command
 exec "$@"

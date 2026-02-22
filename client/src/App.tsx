@@ -14,6 +14,7 @@ interface AgentFormData {
     goal: string;
     systemPrompt: string;
     tools: string[];
+    budgetUsd: number;
 }
 
 interface Message {
@@ -57,8 +58,13 @@ function App() {
     const [submitting, setSubmitting] = useState(false);
     const [editingAgentId, setEditingAgentId] = useState<string | null>(null);
     const [formData, setFormData] = useState<AgentFormData>({
-        name: '', role: '', goal: '', systemPrompt: '', tools: [],
+        name: '', role: '', goal: '', systemPrompt: '', tools: [], budgetUsd: 5.0,
     });
+
+    // State: Version History
+    const [versionHistoryAgentId, setVersionHistoryAgentId] = useState<string | null>(null);
+    const [versionHistory, setVersionHistory] = useState<any[]>([]);
+    const [loadingVersions, setLoadingVersions] = useState(false);
 
     // State: Create Tool
     const [toolFormData, setToolFormData] = useState({ name: '', description: '', parameters: '' });
@@ -225,7 +231,7 @@ function App() {
             });
             if (!res.ok) throw new Error('Failed');
             setSuccessMessage(`🎉 Agent ${editingAgentId ? 'updated' : 'deployed'} successfully!`);
-            setFormData({ name: '', role: '', goal: '', systemPrompt: '', tools: [] });
+            setFormData({ name: '', role: '', goal: '', systemPrompt: '', tools: [], budgetUsd: 5.0 });
             setEditingAgentId(null);
             fetchAgents();
         } catch (err) { setErrorMessage(`Failed to ${editingAgentId ? 'update' : 'deploy'} agent.`); }
@@ -267,9 +273,43 @@ function App() {
             role: agent.role,
             goal: agent.goal,
             systemPrompt: agent.systemPrompt,
-            tools: agentToolIds
+            tools: agentToolIds,
+            budgetUsd: agent.budgetUsd ?? 5.0
         });
         window.scrollTo({ top: 0, behavior: 'smooth' });
+    };
+
+    const handleViewVersions = async (agentId: string) => {
+        setVersionHistoryAgentId(agentId);
+        setLoadingVersions(true);
+        try {
+            const res = await fetch(`/api/agents/${agentId}/versions`);
+            const data = await res.json();
+            setVersionHistory(data);
+        } catch { setVersionHistory([]); }
+        finally { setLoadingVersions(false); }
+    };
+
+    const handleRollback = async (agentId: string, version: number) => {
+        if (!window.confirm(`Rollback to version ${version}? Current state will be saved as a new version.`)) return;
+        try {
+            const res = await fetch(`/api/agents/${agentId}/rollback/${version}`, { method: 'POST' });
+            if (res.ok) {
+                setSuccessMessage(`↩️ Agent rolled back to version ${version}!`);
+                setVersionHistoryAgentId(null);
+                fetchAgents();
+            } else { setErrorMessage('Failed to rollback agent.'); }
+        } catch { setErrorMessage('Rollback failed.'); }
+    };
+
+    const handleReactivate = async (agentId: string) => {
+        try {
+            const res = await fetch(`/api/agents/${agentId}/reactivate`, { method: 'POST' });
+            if (res.ok) {
+                setSuccessMessage('🔄 Agent reactivated!');
+                fetchAgents();
+            } else { setErrorMessage('Failed to reactivate agent.'); }
+        } catch { setErrorMessage('Reactivation failed.'); }
     };
 
     const handleDeleteAgent = async (id: string) => {
@@ -280,7 +320,7 @@ function App() {
                 setSuccessMessage('Agent deleted successfully.');
                 if (editingAgentId === id) {
                     setEditingAgentId(null);
-                    setFormData({ name: '', role: '', goal: '', systemPrompt: '', tools: [] });
+                    setFormData({ name: '', role: '', goal: '', systemPrompt: '', tools: [], budgetUsd: 5.0 });
                 }
                 if (selectedAgentId === id) {
                     setSelectedAgentId('');
@@ -496,14 +536,25 @@ function App() {
                                                 <p className="font-bold text-lg text-white">{agent.name}</p>
                                                 <p className="text-xs text-gray-400 font-mono">{agent.role}</p>
                                             </div>
+                                            <div className="flex items-center gap-2">
+                                                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold border ${agent.isActive !== false ? 'bg-green-900/30 border-green-600 text-green-400' : 'bg-red-900/30 border-red-600 text-red-400'}`}>
+                                                    {agent.isActive !== false ? '🟢 Active' : '🔴 Shutdown'}
+                                                </span>
+                                                {agent.currentVersion > 1 && <span className="text-[10px] text-gray-500 font-mono">v{agent.currentVersion}</span>}
+                                            </div>
                                         </div>
-                                        <div className="flex gap-2 mt-4">
+                                        <p className="text-xs text-gray-500 mt-1">Budget: ${(agent.budgetUsd ?? 5.0).toFixed(2)}</p>
+                                        <div className="flex gap-2 mt-3">
                                             <button type="button" onClick={() => handleEditClick(agent)} className="flex-1 py-1.5 bg-blue-900/40 hover:bg-blue-800/60 border border-blue-700/50 text-blue-300 text-sm rounded-lg transition-colors">Edit</button>
+                                            <button type="button" onClick={() => handleViewVersions(agent.id)} className="flex-1 py-1.5 bg-purple-900/40 hover:bg-purple-800/60 border border-purple-700/50 text-purple-300 text-sm rounded-lg transition-colors">📜 History</button>
                                             <button type="button" onClick={() => handleDeleteAgent(agent.id)} className="flex-1 py-1.5 bg-red-900/40 hover:bg-red-800/60 border border-red-700/50 text-red-300 text-sm rounded-lg transition-colors">Delete</button>
                                         </div>
+                                        {agent.isActive === false && (
+                                            <button type="button" onClick={() => handleReactivate(agent.id)} className="w-full mt-2 py-1.5 bg-green-900/40 hover:bg-green-800/60 border border-green-700/50 text-green-300 text-sm rounded-lg transition-colors">🔄 Reactivate Agent</button>
+                                        )}
                                     </div>
                                 ))}
-                                <button type="button" onClick={() => { setEditingAgentId(null); setFormData({ name: '', role: '', goal: '', systemPrompt: '', tools: [] }); }} className="w-full py-4 border-2 border-dashed border-gray-600 hover:border-purple-500 rounded-xl text-gray-400 hover:text-purple-400 transition-colors font-medium">
+                                <button type="button" onClick={() => { setEditingAgentId(null); setFormData({ name: '', role: '', goal: '', systemPrompt: '', tools: [], budgetUsd: 5.0 }); }} className="w-full py-4 border-2 border-dashed border-gray-600 hover:border-purple-500 rounded-xl text-gray-400 hover:text-purple-400 transition-colors font-medium">
                                     + Create New Blueprint
                                 </button>
                             </div>
@@ -532,6 +583,16 @@ function App() {
                                 <textarea name="systemPrompt" value={formData.systemPrompt} onChange={handleInputChange} required rows={4} className="w-full px-4 py-3 bg-gray-900/50 border border-gray-600 rounded-xl focus:ring-2 focus:ring-purple-500 outline-none" placeholder="Instructions..." />
                             </div>
 
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-300 mb-1">💰 Budget (USD)</label>
+                                    <input type="number" step="0.01" min="0.01" value={formData.budgetUsd} onChange={e => setFormData({ ...formData, budgetUsd: parseFloat(e.target.value) || 5.0 })} className="w-full px-4 py-3 bg-gray-900/50 border border-gray-600 rounded-xl focus:ring-2 focus:ring-purple-500 outline-none" />
+                                </div>
+                                <div className="flex items-end">
+                                    <p className="text-xs text-gray-500 pb-3">Agent auto-shuts down when spend exceeds this limit.</p>
+                                </div>
+                            </div>
+
                             <div>
                                 <label className="block text-sm font-medium text-gray-300 mb-3">Tools</label>
                                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-h-40 overflow-y-auto p-2 border border-gray-700 rounded-xl bg-gray-900/30">
@@ -548,6 +609,43 @@ function App() {
                                 {submitting ? (editingAgentId ? 'Updating...' : 'Deploying...') : (editingAgentId ? 'Update Agent' : 'Deploy Agent')}
                             </button>
                         </form>
+
+                        {/* Version History Modal */}
+                        {versionHistoryAgentId && (
+                            <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+                                <div className="bg-gray-800 border border-gray-600 rounded-2xl shadow-2xl w-full max-w-2xl max-h-[80vh] flex flex-col">
+                                    <div className="flex justify-between items-center p-6 border-b border-gray-700">
+                                        <h3 className="text-xl font-bold">📜 Version History</h3>
+                                        <button onClick={() => setVersionHistoryAgentId(null)} className="text-gray-400 hover:text-white text-2xl">&times;</button>
+                                    </div>
+                                    <div className="overflow-y-auto p-6 space-y-3 flex-1">
+                                        {loadingVersions ? (
+                                            <p className="text-gray-500 text-center py-8">Loading versions...</p>
+                                        ) : versionHistory.length === 0 ? (
+                                            <p className="text-gray-500 text-center py-8">No version history yet. Edit the agent to create the first snapshot.</p>
+                                        ) : (
+                                            versionHistory.map((v: any) => (
+                                                <div key={v.id} className="p-4 bg-gray-900/60 border border-gray-700 rounded-xl">
+                                                    <div className="flex justify-between items-center mb-2">
+                                                        <div className="flex items-center gap-3">
+                                                            <span className="px-2 py-0.5 bg-purple-900/50 border border-purple-600 text-purple-300 rounded-full text-xs font-bold">v{v.version}</span>
+                                                            <span className="text-white font-medium">{v.name}</span>
+                                                        </div>
+                                                        <button onClick={() => handleRollback(v.agentId, v.version)} className="px-3 py-1 bg-yellow-900/40 hover:bg-yellow-800/60 border border-yellow-700/50 text-yellow-300 text-xs rounded-lg transition-colors">↩️ Restore</button>
+                                                    </div>
+                                                    <p className="text-xs text-gray-400">Role: {v.role} · Tools: {v.toolNames?.join(', ') || 'none'}</p>
+                                                    <p className="text-xs text-gray-500 mt-1">Changed by: {v.changedBy} · {new Date(v.createdAt).toLocaleString()}</p>
+                                                    <details className="mt-2">
+                                                        <summary className="text-xs text-gray-500 cursor-pointer hover:text-gray-300">System Prompt</summary>
+                                                        <p className="text-xs text-gray-400 mt-1 whitespace-pre-wrap bg-gray-800 p-2 rounded-lg">{v.systemPrompt}</p>
+                                                    </details>
+                                                </div>
+                                            ))
+                                        )}
+                                    </div>
+                                </div>
+                            </div>
+                        )}
                     </div>
                 )}
 
@@ -710,6 +808,8 @@ function App() {
                                     <thead className="bg-gray-900/50 uppercase font-medium text-xs">
                                         <tr>
                                             <th className="px-4 py-3">Agent</th>
+                                            <th className="px-4 py-3">Budget</th>
+                                            <th className="px-4 py-3">Status</th>
                                             <th className="px-4 py-3">Invocations</th>
                                             <th className="px-4 py-3">Tokens</th>
                                             <th className="px-4 py-3">Cost (USD)</th>
@@ -717,16 +817,33 @@ function App() {
                                     </thead>
                                     <tbody className="divide-y divide-gray-700">
                                         {(!stats.perAgentCosts || stats.perAgentCosts.length === 0) && (
-                                            <tr><td colSpan={4} className="px-4 py-6 text-center text-gray-500">No usage recorded yet. Chat with an agent to generate cost data.</td></tr>
+                                            <tr><td colSpan={6} className="px-4 py-6 text-center text-gray-500">No usage recorded yet. Chat with an agent to generate cost data.</td></tr>
                                         )}
-                                        {stats.perAgentCosts?.map((ac: any) => (
-                                            <tr key={ac.agentId} className="hover:bg-gray-700/30">
-                                                <td className="px-4 py-3 text-white font-medium">{ac.agentName}</td>
-                                                <td className="px-4 py-3">{ac.invocations}</td>
-                                                <td className="px-4 py-3">{ac.totalTokens.toLocaleString()}</td>
-                                                <td className="px-4 py-3 text-green-400 font-mono">${ac.totalCost.toFixed(6)}</td>
-                                            </tr>
-                                        ))}
+                                        {stats.perAgentCosts?.map((ac: any) => {
+                                            const agentData = agents.find((a: any) => a.id === ac.agentId);
+                                            const budget = agentData?.budgetUsd ?? 5.0;
+                                            const isActive = agentData?.isActive !== false;
+                                            const costPercent = budget > 0 ? (ac.totalCost / budget) * 100 : 0;
+                                            return (
+                                                <tr key={ac.agentId} className="hover:bg-gray-700/30">
+                                                    <td className="px-4 py-3 text-white font-medium">{ac.agentName}</td>
+                                                    <td className="px-4 py-3">
+                                                        <span className="font-mono">${budget.toFixed(2)}</span>
+                                                        {costPercent > 80 && <span className="ml-1 text-[10px] text-yellow-400">⚠️ {costPercent.toFixed(0)}%</span>}
+                                                    </td>
+                                                    <td className="px-4 py-3">
+                                                        {isActive ? (
+                                                            <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-green-900/30 border border-green-600 text-green-400">Active</span>
+                                                        ) : (
+                                                            <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-red-900/30 border border-red-600 text-red-400">Shutdown</span>
+                                                        )}
+                                                    </td>
+                                                    <td className="px-4 py-3">{ac.invocations}</td>
+                                                    <td className="px-4 py-3">{ac.totalTokens.toLocaleString()}</td>
+                                                    <td className="px-4 py-3 text-green-400 font-mono">${ac.totalCost.toFixed(6)}</td>
+                                                </tr>
+                                            );
+                                        })}
                                     </tbody>
                                 </table>
                             </div>

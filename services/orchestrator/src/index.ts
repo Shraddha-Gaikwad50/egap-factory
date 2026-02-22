@@ -96,6 +96,7 @@ interface AgentPayload {
     goal: string;
     systemPrompt: string;
     tools: string[];
+    budgetUsd?: number;
 }
 
 interface ChatPayload {
@@ -157,7 +158,7 @@ app.get('/api/agents', async (_request, _reply) => {
  * Create a new agent (Blueprint)
  */
 app.post<{ Body: AgentPayload }>('/api/agents', async (request, reply) => {
-    const { name, role, goal, systemPrompt, tools } = request.body;
+    const { name, role, goal, systemPrompt, tools, budgetUsd } = request.body;
 
     try {
         const agent = await prisma.agent.create({
@@ -166,6 +167,7 @@ app.post<{ Body: AgentPayload }>('/api/agents', async (request, reply) => {
                 role,
                 goal,
                 systemPrompt,
+                budgetUsd: budgetUsd ?? 5.0,
                 tools: {
                     connectOrCreate: tools.map((toolId) => ({
                         where: { name: toolId },
@@ -190,9 +192,30 @@ app.post<{ Body: AgentPayload }>('/api/agents', async (request, reply) => {
  */
 app.put<{ Params: { id: string }, Body: AgentPayload }>('/api/agents/:id', async (request, reply) => {
     const { id } = request.params;
-    const { name, role, goal, systemPrompt, tools } = request.body;
+    const { name, role, goal, systemPrompt, tools, budgetUsd } = request.body;
 
     try {
+        // ── VERSIONING: Snapshot current state before updating ──
+        const current = await prisma.agent.findUnique({
+            where: { id },
+            include: { tools: true }
+        });
+
+        if (current) {
+            await prisma.agentVersion.create({
+                data: {
+                    agentId: id,
+                    version: current.currentVersion,
+                    name: current.name,
+                    role: current.role,
+                    goal: current.goal,
+                    systemPrompt: current.systemPrompt,
+                    toolNames: current.tools.map(t => t.name),
+                    changedBy: 'admin',
+                }
+            });
+        }
+
         const agent = await prisma.agent.update({
             where: { id },
             data: {
@@ -200,6 +223,8 @@ app.put<{ Params: { id: string }, Body: AgentPayload }>('/api/agents/:id', async
                 role,
                 goal,
                 systemPrompt,
+                currentVersion: (current?.currentVersion || 1) + 1,
+                ...(budgetUsd !== undefined ? { budgetUsd } : {}),
                 tools: {
                     set: [], // Clear existing relations
                     connectOrCreate: tools.map((toolId) => ({
@@ -208,6 +233,7 @@ app.put<{ Params: { id: string }, Body: AgentPayload }>('/api/agents/:id', async
                     })),
                 },
             },
+            include: { tools: true }
         });
         return reply.send(agent);
     } catch (err: any) {
@@ -234,6 +260,101 @@ app.delete<{ Params: { id: string } }>('/api/agents/:id', async (request, reply)
     } catch (err: any) {
         app.log.error(err);
         return reply.status(500).send({ error: 'Failed to delete agent' });
+    }
+});
+
+/**
+ * GET /api/agents/:id/versions
+ * Fetch version history for an agent
+ */
+app.get<{ Params: { id: string } }>('/api/agents/:id/versions', async (request, _reply) => {
+    const { id } = request.params;
+    const versions = await prisma.agentVersion.findMany({
+        where: { agentId: id },
+        orderBy: { version: 'desc' }
+    });
+    return versions;
+});
+
+/**
+ * POST /api/agents/:id/rollback/:version
+ * Rollback an agent to a previous version
+ */
+app.post<{ Params: { id: string; version: string } }>('/api/agents/:id/rollback/:version', async (request, reply) => {
+    const { id, version } = request.params;
+    const versionNum = parseInt(version, 10);
+
+    try {
+        const snapshot = await prisma.agentVersion.findUnique({
+            where: { agentId_version: { agentId: id, version: versionNum } }
+        });
+
+        if (!snapshot) {
+            return reply.status(404).send({ error: 'Version not found' });
+        }
+
+        // Snapshot current state first
+        const current = await prisma.agent.findUnique({
+            where: { id },
+            include: { tools: true }
+        });
+
+        if (current) {
+            await prisma.agentVersion.create({
+                data: {
+                    agentId: id,
+                    version: current.currentVersion,
+                    name: current.name,
+                    role: current.role,
+                    goal: current.goal,
+                    systemPrompt: current.systemPrompt,
+                    toolNames: current.tools.map(t => t.name),
+                    changedBy: 'admin (rollback)',
+                }
+            });
+        }
+
+        // Restore agent to the snapshot
+        const agent = await prisma.agent.update({
+            where: { id },
+            data: {
+                name: snapshot.name,
+                role: snapshot.role,
+                goal: snapshot.goal,
+                systemPrompt: snapshot.systemPrompt,
+                currentVersion: (current?.currentVersion || 1) + 1,
+                tools: {
+                    set: [],
+                    connectOrCreate: snapshot.toolNames.map((toolName) => ({
+                        where: { name: toolName },
+                        create: { name: toolName, description: 'Auto-created tool stub' },
+                    })),
+                },
+            },
+            include: { tools: true }
+        });
+
+        return reply.send({ success: true, agent, restoredFromVersion: versionNum });
+    } catch (err: any) {
+        app.log.error(err);
+        return reply.status(500).send({ error: 'Failed to rollback agent' });
+    }
+});
+
+/**
+ * POST /api/agents/:id/reactivate
+ * Reactivate a shutdown agent (resets isActive to true)
+ */
+app.post<{ Params: { id: string } }>('/api/agents/:id/reactivate', async (request, reply) => {
+    const { id } = request.params;
+    try {
+        const agent = await prisma.agent.update({
+            where: { id },
+            data: { isActive: true }
+        });
+        return reply.send({ success: true, agent });
+    } catch (err: any) {
+        return reply.status(500).send({ error: 'Failed to reactivate agent' });
     }
 });
 
@@ -539,18 +660,29 @@ async function processChat(data: { type: string; agentId: string; message: strin
             parts: [{ text: msg.content }]
         }));
 
-        // ── BUDGET GUARDRAIL ─────────────────────────────────────────
+        // ── AGENT ACTIVE CHECK ────────────────────────────────────────
+        if (!agent.isActive) {
+            console.error(`🛑 AGENT SHUTDOWN: Agent ${agentId} is deactivated.`);
+            await prisma.message.create({
+                data: { agentId, role: 'assistant', content: `[System] ⚠️ This agent has been shut down (budget exceeded or manually deactivated). An admin must reactivate it.` }
+            });
+            return;
+        }
+
+        // ── BUDGET GUARDRAIL (Dynamic per-agent) ─────────────────────
         const allMessages = await prisma.message.findMany({
             where: { agentId },
             select: { cost: true }
         });
         const currentSpend = allMessages.reduce((sum: number, msg: any) => sum + (msg.cost || 0), 0);
-        const MAX_BUDGET = 5.00;
+        const agentBudget = agent.budgetUsd ?? 5.0;
 
-        if (currentSpend >= MAX_BUDGET) {
-            console.error(`🛑 BUDGET LIMIT: Agent ${agentId} spent $${currentSpend.toFixed(4)} (Limit: $${MAX_BUDGET.toFixed(2)})`);
+        if (currentSpend >= agentBudget) {
+            console.error(`🛑 BUDGET LIMIT: Agent ${agentId} spent $${currentSpend.toFixed(4)} (Limit: $${agentBudget.toFixed(2)}) — AUTO-SHUTDOWN`);
+            // Auto-shutdown the agent
+            await prisma.agent.update({ where: { id: agentId }, data: { isActive: false } });
             await prisma.message.create({
-                data: { agentId, role: 'assistant', content: `[System Error] 🛑 Agent budget limit reached ($${currentSpend.toFixed(4)} / $${MAX_BUDGET.toFixed(2)}). Execution blocked.` }
+                data: { agentId, role: 'assistant', content: `[System] 🛑 Agent budget limit reached ($${currentSpend.toFixed(4)} / $${agentBudget.toFixed(2)}). Agent has been automatically shut down. Contact an admin to reactivate.` }
             });
             return;
         }
