@@ -1,5 +1,6 @@
 
 import { useEffect, useState, useRef } from 'react';
+import { AreaChart, Area, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 
 // ── Types ────────────────────────────────────────────────────────────
 interface Tool {
@@ -37,15 +38,30 @@ interface Task {
     id: string;
     description: string;
     status: string;
+    inputPayload: any;
     createdAt: string;
     agent?: { name: string };
+}
+
+interface CostTimeseries {
+    date: string;
+    agentName: string;
+    totalCost: number;
+    totalTokens: number;
+}
+
+interface AgentTotal {
+    agentId: string;
+    agentName: string;
+    totalCost: number;
+    totalTokens: number;
 }
 
 // ── App Component ────────────────────────────────────────────────────
 function App() {
     // State: UI
     const [currentUserRole, setCurrentUserRole] = useState<'admin' | 'user' | null>(null);
-    const [activeTab, setActiveTab] = useState<'create' | 'tools' | 'test' | 'govern' | 'observe'>('test');
+    const [activeTab, setActiveTab] = useState<'create' | 'tools' | 'test' | 'govern' | 'observe' | 'analytics'>('test');
     const [_loading, setLoading] = useState(true);
     const [successMessage, setSuccessMessage] = useState('');
     const [errorMessage, setErrorMessage] = useState('');
@@ -84,6 +100,15 @@ function App() {
     const [tasks, setTasks] = useState<Task[]>([]);
     const [reconciliation, setReconciliation] = useState<any>(null);
 
+    // State: Analytics
+    const [costTimeseries, setCostTimeseries] = useState<CostTimeseries[]>([]);
+    const [agentTotals, setAgentTotals] = useState<AgentTotal[]>([]);
+
+    // State: Task Editing
+    const [editingTaskId, setEditingTaskId] = useState<string | null>(null);
+    const [editingPayload, setEditingPayload] = useState<string>('');
+    const [savingTask, setSavingTask] = useState(false);
+
     // ── Effects ──────────────────────────────────────────────────────
     useEffect(() => {
         fetchTools();
@@ -96,6 +121,7 @@ function App() {
             if (activeTab === 'test' && selectedAgentId) fetchMessages();
             if (activeTab === 'observe') { fetchStats(); fetchReconciliation(); }
             if (activeTab === 'govern') fetchTasks();
+            if (activeTab === 'analytics') fetchCostTimeseries();
             fetchEmergencyStatus(); // Always poll safety status
         }, 3000);
         return () => clearInterval(interval);
@@ -192,6 +218,17 @@ function App() {
         try {
             const res = await fetch('/api/tasks');
             if (res.ok) setTasks(await res.json());
+        } catch (e) { console.error(e); }
+    };
+
+    const fetchCostTimeseries = async () => {
+        try {
+            const res = await fetch('/api/dashboard/cost-timeseries');
+            if (res.ok) {
+                const data = await res.json();
+                setCostTimeseries(data.timeseries || []);
+                setAgentTotals(data.agentTotals || []);
+            }
         } catch (e) { console.error(e); }
     };
 
@@ -378,9 +415,48 @@ function App() {
             const res = await fetch(`/api/tasks/${taskId}/${action}`, { method: 'POST' });
             if (res.ok) {
                 setSuccessMessage(`Task ${action}d!`);
+                setEditingTaskId(null);
                 fetchTasks();
             }
         } catch (e) { setErrorMessage('Action failed'); }
+    };
+
+    const handleEditTask = (task: Task) => {
+        if (editingTaskId === task.id) {
+            setEditingTaskId(null);
+            return;
+        }
+        setEditingTaskId(task.id);
+        setEditingPayload(JSON.stringify(task.inputPayload || {}, null, 2));
+    };
+
+    const handleSaveTaskEdit = async (taskId: string) => {
+        setSavingTask(true);
+        try {
+            let parsedPayload;
+            try {
+                parsedPayload = JSON.parse(editingPayload);
+            } catch {
+                setErrorMessage('Invalid JSON in payload editor.');
+                setSavingTask(false);
+                return;
+            }
+
+            const res = await fetch(`/api/tasks/${taskId}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ inputPayload: parsedPayload }),
+            });
+
+            if (res.ok) {
+                setSuccessMessage('✅ Task payload updated!');
+                fetchTasks();
+            } else {
+                const data = await res.json();
+                setErrorMessage(data.error || 'Failed to update task.');
+            }
+        } catch (e) { setErrorMessage('Failed to save task edit.'); }
+        finally { setSavingTask(false); }
     };
 
     // ── Render ───────────────────────────────────────────────────────
@@ -451,7 +527,8 @@ function App() {
                             { id: 'tools', label: 'Tools' },
                             { id: 'test', label: 'Test Flight' },
                             { id: 'govern', label: 'Governance' },
-                            { id: 'observe', label: 'Observability' }
+                            { id: 'observe', label: 'Observability' },
+                            { id: 'analytics', label: '📊 Analytics' }
                         ] : [
                             { id: 'test', label: 'Test Flight' }
                         ]).map(tab => (
@@ -718,19 +795,55 @@ function App() {
                                 <p className="text-gray-500 text-center py-10">No pending tasks requiring approval.</p>
                             ) : (
                                 tasks.map(task => (
-                                    <div key={task.id} className="bg-gray-800/80 border border-gray-700 rounded-xl p-6 flex justify-between items-center">
-                                        <div>
-                                            <div className="flex items-center gap-3 mb-2">
-                                                <span className="bg-yellow-500/20 text-yellow-300 text-xs px-2 py-1 rounded-full border border-yellow-500/30">PENDING</span>
-                                                <span className="text-gray-400 text-sm">{new Date(task.createdAt).toLocaleString()}</span>
-                                                <span className="text-purple-400 text-sm font-bold">@{task.agent?.name || 'System'}</span>
+                                    <div key={task.id} className="bg-gray-800/80 border border-gray-700 rounded-xl p-6">
+                                        <div className="flex justify-between items-start">
+                                            <div className="flex-1">
+                                                <div className="flex items-center gap-3 mb-2">
+                                                    <span className="bg-yellow-500/20 text-yellow-300 text-xs px-2 py-1 rounded-full border border-yellow-500/30">PENDING</span>
+                                                    <span className="text-gray-400 text-sm">{new Date(task.createdAt).toLocaleString()}</span>
+                                                    <span className="text-purple-400 text-sm font-bold">@{task.agent?.name || 'System'}</span>
+                                                </div>
+                                                <p className="text-lg">{task.description}</p>
                                             </div>
-                                            <p className="text-lg">{task.description}</p>
+                                            <div className="flex gap-3 ml-4">
+                                                <button onClick={() => handleEditTask(task)} className={`px-4 py-2 border rounded-lg transition-colors text-sm ${editingTaskId === task.id ? 'bg-blue-700 border-blue-500 text-white' : 'bg-blue-900/50 border-blue-600 text-blue-300 hover:bg-blue-800'}`}>
+                                                    {editingTaskId === task.id ? 'Close Editor' : '✏️ Edit Payload'}
+                                                </button>
+                                                <button onClick={() => handleVote(task.id, 'reject')} className="px-4 py-2 bg-red-900/50 border border-red-600 text-red-300 rounded-lg hover:bg-red-800 transition-colors">Reject</button>
+                                                <button onClick={() => handleVote(task.id, 'approve')} className="px-4 py-2 bg-green-900/50 border border-green-600 text-green-300 rounded-lg hover:bg-green-800 transition-colors">Approve</button>
+                                            </div>
                                         </div>
-                                        <div className="flex gap-3">
-                                            <button onClick={() => handleVote(task.id, 'reject')} className="px-4 py-2 bg-red-900/50 border border-red-600 text-red-300 rounded-lg hover:bg-red-800 transition-colors">Reject</button>
-                                            <button onClick={() => handleVote(task.id, 'approve')} className="px-4 py-2 bg-green-900/50 border border-green-600 text-green-300 rounded-lg hover:bg-green-800 transition-colors">Approve</button>
-                                        </div>
+
+                                        {/* Expandable Payload Editor */}
+                                        {editingTaskId === task.id && (
+                                            <div className="mt-4 p-4 bg-gray-900/60 border border-gray-600 rounded-xl space-y-3 animate-in">
+                                                <div className="flex justify-between items-center">
+                                                    <label className="text-sm font-medium text-gray-300">Input Payload (JSON)</label>
+                                                    <span className="text-xs text-gray-500">Edit the payload before approving</span>
+                                                </div>
+                                                <textarea
+                                                    value={editingPayload}
+                                                    onChange={(e) => setEditingPayload(e.target.value)}
+                                                    rows={8}
+                                                    className="w-full px-4 py-3 bg-gray-800 border border-gray-600 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none font-mono text-sm text-green-300 whitespace-pre"
+                                                />
+                                                <div className="flex gap-3">
+                                                    <button
+                                                        onClick={() => handleSaveTaskEdit(task.id)}
+                                                        disabled={savingTask}
+                                                        className="px-6 py-2 bg-gradient-to-r from-blue-600 to-cyan-600 hover:from-blue-700 hover:to-cyan-700 rounded-lg font-bold text-white text-sm transition-all disabled:opacity-50"
+                                                    >
+                                                        {savingTask ? 'Saving...' : '💾 Save Edit'}
+                                                    </button>
+                                                    <button
+                                                        onClick={() => setEditingPayload(JSON.stringify(task.inputPayload || {}, null, 2))}
+                                                        className="px-4 py-2 bg-gray-700 hover:bg-gray-600 border border-gray-600 text-gray-300 rounded-lg text-sm transition-colors"
+                                                    >
+                                                        Reset
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        )}
                                     </div>
                                 ))
                             )}
@@ -887,6 +1000,126 @@ function App() {
                             ) : (
                                 <p className="text-gray-500">Loading reconciliation data...</p>
                             )}
+                        </div>
+                    </div>
+                )}
+
+                {/* ── TAB: ANALYTICS ────────────────────────────────────── */}
+                {activeTab === 'analytics' && (
+                    <div className="max-w-6xl mx-auto space-y-8">
+                        <div className="flex justify-between items-center">
+                            <h2 className="text-2xl font-bold">📊 Cost & Usage Analytics</h2>
+                            <button onClick={fetchCostTimeseries} className="px-4 py-2 bg-gray-800 hover:bg-gray-700 border border-gray-600 text-gray-300 rounded-xl text-sm transition-colors">
+                                🔄 Refresh
+                            </button>
+                        </div>
+
+                        {/* Cost Over Time — Area Chart */}
+                        <div className="bg-gray-800/50 border border-gray-700 rounded-2xl p-6">
+                            <h3 className="text-xl font-bold mb-2">💸 Daily Cost Over Time (Last 30 Days)</h3>
+                            <p className="text-gray-500 text-sm mb-6">Aggregated from UsageLog records, per agent, per day.</p>
+                            {costTimeseries.length === 0 ? (
+                                <div className="text-center py-16 text-gray-500">
+                                    <p className="text-4xl mb-3">📉</p>
+                                    <p>No usage data yet. Chat with an agent in Test Flight to generate data.</p>
+                                </div>
+                            ) : (
+                                <ResponsiveContainer width="100%" height={350}>
+                                    <AreaChart data={(() => {
+                                        // Reshape data: pivot by date, with each agent as a separate key
+                                        const dateMap = new Map<string, any>();
+                                        for (const entry of costTimeseries) {
+                                            if (!dateMap.has(entry.date)) dateMap.set(entry.date, { date: entry.date });
+                                            const row = dateMap.get(entry.date);
+                                            row[entry.agentName] = (row[entry.agentName] || 0) + entry.totalCost;
+                                        }
+                                        return Array.from(dateMap.values());
+                                    })()}>
+                                        <defs>
+                                            <linearGradient id="colorGrad1" x1="0" y1="0" x2="0" y2="1">
+                                                <stop offset="5%" stopColor="#8b5cf6" stopOpacity={0.4} />
+                                                <stop offset="95%" stopColor="#8b5cf6" stopOpacity={0} />
+                                            </linearGradient>
+                                            <linearGradient id="colorGrad2" x1="0" y1="0" x2="0" y2="1">
+                                                <stop offset="5%" stopColor="#06b6d4" stopOpacity={0.4} />
+                                                <stop offset="95%" stopColor="#06b6d4" stopOpacity={0} />
+                                            </linearGradient>
+                                            <linearGradient id="colorGrad3" x1="0" y1="0" x2="0" y2="1">
+                                                <stop offset="5%" stopColor="#f59e0b" stopOpacity={0.4} />
+                                                <stop offset="95%" stopColor="#f59e0b" stopOpacity={0} />
+                                            </linearGradient>
+                                        </defs>
+                                        <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                                        <XAxis dataKey="date" stroke="#9ca3af" tick={{ fontSize: 11 }} />
+                                        <YAxis stroke="#9ca3af" tick={{ fontSize: 11 }} tickFormatter={(v: number) => `$${v.toFixed(4)}`} />
+                                        <Tooltip
+                                            contentStyle={{ backgroundColor: '#1f2937', border: '1px solid #4b5563', borderRadius: '12px', color: '#fff' }}
+                                            formatter={(value: any) => [`$${Number(value).toFixed(6)}`, '']}
+                                        />
+                                        <Legend />
+                                        {agentTotals.map((agent, idx) => {
+                                            const colors = ['#8b5cf6', '#06b6d4', '#f59e0b', '#ec4899', '#10b981', '#f97316'];
+                                            const gradients = ['colorGrad1', 'colorGrad2', 'colorGrad3', 'colorGrad1', 'colorGrad2', 'colorGrad3'];
+                                            return (
+                                                <Area
+                                                    key={agent.agentId}
+                                                    type="monotone"
+                                                    dataKey={agent.agentName}
+                                                    stroke={colors[idx % colors.length]}
+                                                    fillOpacity={1}
+                                                    fill={`url(#${gradients[idx % gradients.length]})`}
+                                                />
+                                            );
+                                        })}
+                                    </AreaChart>
+                                </ResponsiveContainer>
+                            )}
+                        </div>
+
+                        {/* Per-Agent Token Distribution — Bar Chart */}
+                        <div className="bg-gray-800/50 border border-gray-700 rounded-2xl p-6">
+                            <h3 className="text-xl font-bold mb-2">🧮 Per-Agent Token Distribution</h3>
+                            <p className="text-gray-500 text-sm mb-6">Total tokens consumed by each agent in the last 30 days.</p>
+                            {agentTotals.length === 0 ? (
+                                <div className="text-center py-16 text-gray-500">
+                                    <p className="text-4xl mb-3">📊</p>
+                                    <p>No token usage data yet.</p>
+                                </div>
+                            ) : (
+                                <ResponsiveContainer width="100%" height={300}>
+                                    <BarChart data={agentTotals} layout="vertical">
+                                        <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                                        <XAxis type="number" stroke="#9ca3af" tick={{ fontSize: 11 }} />
+                                        <YAxis dataKey="agentName" type="category" stroke="#9ca3af" tick={{ fontSize: 12 }} width={120} />
+                                        <Tooltip
+                                            contentStyle={{ backgroundColor: '#1f2937', border: '1px solid #4b5563', borderRadius: '12px', color: '#fff' }}
+                                            formatter={(value: any, name: any) => {
+                                                if (name === 'totalTokens') return [Number(value).toLocaleString(), 'Tokens'];
+                                                return [`$${Number(value).toFixed(6)}`, 'Cost (USD)'];
+                                            }}
+                                        />
+                                        <Legend />
+                                        <Bar dataKey="totalTokens" name="Tokens" fill="#8b5cf6" radius={[0, 6, 6, 0]} />
+                                        <Bar dataKey="totalCost" name="Cost ($)" fill="#06b6d4" radius={[0, 6, 6, 0]} />
+                                    </BarChart>
+                                </ResponsiveContainer>
+                            )}
+                        </div>
+
+                        {/* Summary Cards */}
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                            <div className="bg-gray-800/50 border border-gray-700 p-6 rounded-2xl">
+                                <h3 className="text-gray-400 text-sm font-medium">Total Cost (30d)</h3>
+                                <p className="text-3xl font-bold text-green-400 mt-2">${agentTotals.reduce((s, a) => s + a.totalCost, 0).toFixed(6)}</p>
+                            </div>
+                            <div className="bg-gray-800/50 border border-gray-700 p-6 rounded-2xl">
+                                <h3 className="text-gray-400 text-sm font-medium">Total Tokens (30d)</h3>
+                                <p className="text-3xl font-bold text-purple-400 mt-2">{agentTotals.reduce((s, a) => s + a.totalTokens, 0).toLocaleString()}</p>
+                            </div>
+                            <div className="bg-gray-800/50 border border-gray-700 p-6 rounded-2xl">
+                                <h3 className="text-gray-400 text-sm font-medium">Agents Tracked</h3>
+                                <p className="text-3xl font-bold text-cyan-400 mt-2">{agentTotals.length}</p>
+                            </div>
                         </div>
                     </div>
                 )}

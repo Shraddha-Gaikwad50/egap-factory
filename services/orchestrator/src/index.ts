@@ -512,6 +512,39 @@ app.post<{ Params: { id: string } }>('/api/tasks/:id/reject', async (req, rep) =
     }
 });
 
+// 2b. GOVERNANCE: Edit Task Payload Before Approval
+app.put<{ Params: { id: string }, Body: { inputPayload?: any; description?: string } }>('/api/tasks/:id', async (req, rep) => {
+    const { id } = req.params;
+    const { inputPayload, description } = req.body;
+
+    try {
+        // Only allow editing PENDING tasks
+        const existing = await prisma.task.findUnique({ where: { id } });
+        if (!existing) {
+            return rep.status(404).send({ error: 'Task not found' });
+        }
+        if (existing.status !== 'PENDING') {
+            return rep.status(400).send({ error: `Cannot edit a task with status '${existing.status}'. Only PENDING tasks can be edited.` });
+        }
+
+        const updateData: any = {};
+        if (inputPayload !== undefined) updateData.inputPayload = inputPayload;
+        if (description !== undefined) updateData.description = description;
+
+        const task = await prisma.task.update({
+            where: { id },
+            data: updateData,
+            include: { agent: true }
+        });
+
+        console.log(`✏️ Task ${id} payload edited before approval`);
+        return task;
+    } catch (e) {
+        console.error(e);
+        return rep.status(500).send({ error: 'Failed to update task' });
+    }
+});
+
 // 3. OBSERVABILITY: Dashboard Stats
 app.get('/api/dashboard/stats', async (_req, _rep) => {
     // 1. Cost Accounting: Sum up all message costs
@@ -562,6 +595,66 @@ app.get('/api/dashboard/stats', async (_req, _rep) => {
         zombieCount,
         traces,
         perAgentCosts
+    };
+});
+
+// 3b. ANALYTICS: Cost Time-Series (Last 30 Days)
+app.get('/api/dashboard/cost-timeseries', async (_req, _rep) => {
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+    // Fetch all usage logs from the last 30 days
+    const logs = await prisma.usageLog.findMany({
+        where: { createdAt: { gte: thirtyDaysAgo } },
+        select: { agentId: true, costUsd: true, tokens: true, createdAt: true }
+    });
+
+    // Get agent names
+    const allAgents = await prisma.agent.findMany({ select: { id: true, name: true } });
+    const agentMap = new Map(allAgents.map(a => [a.id, a.name]));
+
+    // Aggregate by date + agent
+    const dailyMap = new Map<string, { date: string; agentId: string; agentName: string; totalCost: number; totalTokens: number }>();
+
+    for (const log of logs) {
+        const dateKey = log.createdAt.toISOString().split('T')[0] ?? ''; // YYYY-MM-DD
+        const key = `${dateKey}__${log.agentId}`;
+
+        if (!dailyMap.has(key)) {
+            dailyMap.set(key, {
+                date: dateKey,
+                agentId: log.agentId,
+                agentName: agentMap.get(log.agentId) || 'Unknown',
+                totalCost: 0,
+                totalTokens: 0,
+            });
+        }
+
+        const entry = dailyMap.get(key)!;
+        entry.totalCost += log.costUsd;
+        entry.totalTokens += log.tokens;
+    }
+
+    // Sort by date
+    const timeseries = Array.from(dailyMap.values()).sort((a, b) => a.date.localeCompare(b.date));
+
+    // Also compute per-agent totals for the bar chart
+    const agentTotals = new Map<string, { agentName: string; totalCost: number; totalTokens: number }>();
+    for (const entry of timeseries) {
+        if (!agentTotals.has(entry.agentId)) {
+            agentTotals.set(entry.agentId, { agentName: entry.agentName, totalCost: 0, totalTokens: 0 });
+        }
+        const t = agentTotals.get(entry.agentId)!;
+        t.totalCost += entry.totalCost;
+        t.totalTokens += entry.totalTokens;
+    }
+
+    return {
+        timeseries,
+        agentTotals: Array.from(agentTotals.entries()).map(([agentId, data]) => ({
+            agentId,
+            ...data
+        }))
     };
 });
 
