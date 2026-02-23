@@ -31,7 +31,7 @@ steps:
       - '--add-cloudsql-instances'
       - '${PROJECT_ID}:us-central1:egap-db'
       - '--set-secrets'
-      - 'DB_PASSWORD=egap-db-password:latest'
+      - 'DB_PASSWORD=egap-db-password:latest,GMAIL_USER=gmail-user:latest,GMAIL_APP_PASSWORD=gmail-app-password:latest'
       - '--set-env-vars'
       - 'DB_USER=postgres,DB_NAME=postgres,DB_SOCKET_PATH=/cloudsql/${PROJECT_ID}:us-central1:egap-db,NODE_ENV=production,PROJECT_ID=${PROJECT_ID},SUBSCRIPTION_NAME=egap-local-sub,TOPIC_NAME=egap-ingress-topic'
 

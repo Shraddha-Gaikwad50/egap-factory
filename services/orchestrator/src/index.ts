@@ -11,6 +11,7 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fastifyWebsocket from '@fastify/websocket';
+import nodemailer from 'nodemailer';
 
 // ── Config ───────────────────────────────────────────────────────────
 dotenv.config();
@@ -21,6 +22,8 @@ const TOPIC_NAME = process.env.TOPIC_NAME;
 const LOCATION = 'asia-south1';
 const MODEL_NAME = 'gemini-2.5-flash';
 const PORT = parseInt(process.env.PORT || '3000', 10);
+const GMAIL_USER = process.env.GMAIL_USER || '';
+const GMAIL_APP_PASSWORD = process.env.GMAIL_APP_PASSWORD || '';
 
 if (!SUBSCRIPTION_NAME || !TOPIC_NAME) {
     console.error('❌ Missing required env vars: SUBSCRIPTION_NAME and TOPIC_NAME must be set in .env');
@@ -883,7 +886,7 @@ async function processChat(data: { type: string; agentId: string; message: strin
 
             if (fn.name === 'send_email') {
                 const task = await prisma.task.create({
-                    data: { description: `Agent wants to send email to ${fn.args.recipient}`, status: 'PENDING', agentId: agent.id, inputPayload: fn.args, traceId: data.traceId || null }
+                    data: { description: `Agent wants to send email to ${fn.args.to || fn.args.recipient || 'unknown'}`, status: 'PENDING', agentId: agent.id, inputPayload: fn.args, traceId: data.traceId || null }
                 });
                 await prisma.message.create({ data: { agentId: agent.id, role: 'assistant', content: `[System] Usage of tool '${fn.name}' requires Admin Approval. Task ${task.id} created.`, tokens: totalTokens, cost } });
                 await prisma.usageLog.create({ data: { agentId: agent.id, action: `tool_intercept_${fn.name}`, tokens: totalTokens, costUsd: cost } });
@@ -913,7 +916,7 @@ async function processChat(data: { type: string; agentId: string; message: strin
         }
 
         // Normal Text Response
-        const responseText = firstPart?.text || "I'm sorry, I couldn't generate a response.";
+        const responseText = fullResponseText || firstPart?.text || "I'm sorry, I couldn't generate a response.";
         console.log(`✅ Vertex Response: ${responseText.substring(0, 50)}...`);
         await prisma.message.create({ data: { agentId: agent.id, role: 'assistant', content: responseText, tokens: totalTokens, cost } });
         await prisma.usageLog.create({ data: { agentId: agent.id, action: 'llm_inference', tokens: totalTokens, costUsd: cost } });
@@ -970,13 +973,37 @@ async function handleMessage(message: Message): Promise<void> {
 
             // Execute Action
             let toolOutput = '';
-            if (payload.recipient && payload.subject && payload.body) {
-                // Heuristic: It's send_email
-                console.log(`📧 Sending Email to ${payload.recipient}...`);
-                console.log(`Subject: ${payload.subject}`);
-                console.log(`Body: ${payload.body}`);
-                // In real app: await sendEmail(...)
-                toolOutput = `[System] Email sent to ${payload.recipient}`;
+            if ((payload.to || payload.recipient) && payload.subject && payload.body) {
+                const emailTo = payload.to || payload.recipient;
+                // Real email sending via Gmail SMTP
+                console.log(`📧 Sending real email to ${emailTo}...`);
+                try {
+                    const transporter = nodemailer.createTransport({
+                        service: 'gmail',
+                        auth: {
+                            user: GMAIL_USER,
+                            pass: GMAIL_APP_PASSWORD,
+                        },
+                    });
+                    await transporter.sendMail({
+                        from: `"EGAP Agent" <${GMAIL_USER}>`,
+                        to: emailTo,
+                        subject: payload.subject,
+                        text: payload.body,
+                        html: `<div style="font-family: sans-serif; padding: 20px;">
+                            <h2 style="color: #7c3aed;">📩 EGAP Agent Email</h2>
+                            <hr style="border-color: #e5e7eb;" />
+                            <p>${payload.body.replace(/\n/g, '<br>')}</p>
+                            <hr style="border-color: #e5e7eb;" />
+                            <p style="color: #9ca3af; font-size: 12px;">Sent by EGAP Command Plane on behalf of an AI agent.</p>
+                        </div>`,
+                    });
+                    console.log(`✅ Email successfully sent to ${emailTo}`);
+                    toolOutput = `[System] ✅ Email successfully sent to ${emailTo}`;
+                } catch (emailErr: any) {
+                    console.error(`❌ Email sending failed:`, emailErr.message);
+                    toolOutput = `[System] ❌ Email failed to send: ${emailErr.message}`;
+                }
             } else {
                 toolOutput = `[System] Approved action executed: ${JSON.stringify(payload)}`;
             }

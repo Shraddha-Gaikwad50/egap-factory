@@ -1,6 +1,6 @@
 
 import { useEffect, useState, useRef } from 'react';
-import { AreaChart, Area, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+import { AreaChart, Area, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
 
 // ── Types ────────────────────────────────────────────────────────────
 interface Tool {
@@ -245,10 +245,10 @@ function App() {
         setFormData({ ...formData, [e.target.name]: e.target.value });
     };
 
-    const handleToolToggle = (toolId: string) => {
+    const handleToolToggle = (toolName: string) => {
         setFormData(prev => ({
             ...prev,
-            tools: prev.tools.includes(toolId) ? prev.tools.filter(id => id !== toolId) : [...prev.tools, toolId],
+            tools: prev.tools.includes(toolName) ? prev.tools.filter(n => n !== toolName) : [...prev.tools, toolName],
         }));
     };
 
@@ -565,7 +565,7 @@ function App() {
                         <div className="lg:col-span-1 space-y-4">
                             <h2 className="text-xl font-semibold mb-4 text-gray-300">Registered Tools</h2>
                             <div className="space-y-3 max-h-[600px] overflow-y-auto pr-2">
-                                {tools.map(tool => (
+                                {tools.filter(tool => tool.name && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(tool.name)).map(tool => (
                                     <div key={tool.id} className="p-4 bg-gray-800/80 border border-gray-700 rounded-xl">
                                         <p className="font-bold text-lg text-white">{tool.name}</p>
                                         <p className="text-sm text-gray-400 mt-1">{tool.description}</p>
@@ -610,8 +610,8 @@ function App() {
                                     <div key={agent.id} className={`p-4 bg-gray-800/80 border ${editingAgentId === agent.id ? 'border-purple-500 shadow-[0_0_15px_rgba(168,85,247,0.4)]' : 'border-gray-700'} rounded-xl transition-all group`}>
                                         <div className="flex justify-between items-start mb-2">
                                             <div>
-                                                <p className="font-bold text-lg text-white">{agent.name}</p>
-                                                <p className="text-xs text-gray-400 font-mono">{agent.role}</p>
+                                                <p className="font-bold text-lg text-white">{agent.name || <span className="italic text-gray-500">Unnamed Agent</span>}</p>
+                                                <p className="text-xs text-gray-400 font-mono">{agent.role || 'No role'}</p>
                                             </div>
                                             <div className="flex items-center gap-2">
                                                 <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold border ${agent.isActive !== false ? 'bg-green-900/30 border-green-600 text-green-400' : 'bg-red-900/30 border-red-600 text-red-400'}`}>
@@ -673,9 +673,9 @@ function App() {
                             <div>
                                 <label className="block text-sm font-medium text-gray-300 mb-3">Tools</label>
                                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-h-40 overflow-y-auto p-2 border border-gray-700 rounded-xl bg-gray-900/30">
-                                    {tools.map((tool) => (
-                                        <label key={tool.id} className={`flex items-center gap-3 p-3 rounded-lg cursor-pointer border ${formData.tools.includes(tool.id) ? 'bg-purple-900/40 border-purple-500' : 'border-transparent hover:bg-gray-800'}`}>
-                                            <input type="checkbox" checked={formData.tools.includes(tool.id)} onChange={() => handleToolToggle(tool.id)} className="accent-purple-500" />
+                                    {tools.filter(tool => tool.name && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(tool.name)).map((tool) => (
+                                        <label key={tool.id} className={`flex items-center gap-3 p-3 rounded-lg cursor-pointer border ${formData.tools.includes(tool.name) ? 'bg-purple-900/40 border-purple-500' : 'border-transparent hover:bg-gray-800'}`}>
+                                            <input type="checkbox" checked={formData.tools.includes(tool.name)} onChange={() => handleToolToggle(tool.name)} className="accent-purple-500" />
                                             <span className="text-sm font-medium">{tool.name}</span>
                                         </label>
                                     ))}
@@ -858,7 +858,15 @@ function App() {
                         <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
                             <div className="bg-gray-800/50 border border-gray-700 p-6 rounded-2xl">
                                 <h3 className="text-gray-400 text-sm font-medium">Total Cost (Est.)</h3>
-                                <p className="text-4xl font-bold text-green-400 mt-2">${stats.totalCost.toFixed(2)}</p>
+                                <p className="text-4xl font-bold text-green-400 mt-2">
+                                    {(() => {
+                                        const tc = stats.perAgentCosts?.reduce((s: number, a: any) => s + (a.totalCost || 0), 0) || stats.totalCost || 0;
+                                        if (tc === 0) return '$0.00';
+                                        if (tc >= 1) return `$${tc.toFixed(2)}`;
+                                        if (tc >= 0.01) return `$${tc.toFixed(4)}`;
+                                        return `$${tc.toFixed(6)}`;
+                                    })()}
+                                </p>
                             </div>
                             <div className="bg-gray-800/50 border border-gray-700 p-6 rounded-2xl">
                                 <h3 className="text-gray-400 text-sm font-medium">Active Agents</h3>
@@ -993,7 +1001,13 @@ function App() {
                                     )}
                                     {reconciliation.costSummary && (
                                         <div className="mt-2 text-sm text-gray-400">
-                                            <p>Total Tokens: <span className="text-white">{(reconciliation.costSummary.totalTokens || 0).toLocaleString()}</span> · Total Cost: <span className="text-green-400">${(reconciliation.costSummary.totalCost || 0).toFixed(6)}</span></p>
+                                            <p>Total Tokens: <span className="text-white">{(reconciliation.costSummary.totalTokens || 0).toLocaleString()}</span> · Total Cost: <span className="text-green-400">{(() => {
+                                                const tc = reconciliation.costSummary.totalCostUsd || reconciliation.costSummary.totalCost || 0;
+                                                if (tc === 0) return '$0.00';
+                                                if (tc >= 1) return `$${tc.toFixed(2)}`;
+                                                if (tc >= 0.01) return `$${tc.toFixed(4)}`;
+                                                return `$${tc.toFixed(6)}`;
+                                            })()}</span></p>
                                         </div>
                                     )}
                                 </div>
@@ -1005,124 +1019,296 @@ function App() {
                 )}
 
                 {/* ── TAB: ANALYTICS ────────────────────────────────────── */}
-                {activeTab === 'analytics' && (
-                    <div className="max-w-6xl mx-auto space-y-8">
-                        <div className="flex justify-between items-center">
-                            <h2 className="text-2xl font-bold">📊 Cost & Usage Analytics</h2>
-                            <button onClick={fetchCostTimeseries} className="px-4 py-2 bg-gray-800 hover:bg-gray-700 border border-gray-600 text-gray-300 rounded-xl text-sm transition-colors">
-                                🔄 Refresh
-                            </button>
-                        </div>
+                {activeTab === 'analytics' && (() => {
+                    const CHART_COLORS = ['#8b5cf6', '#06b6d4', '#f59e0b', '#ec4899', '#10b981', '#f97316', '#ef4444', '#3b82f6'];
+                    const totalCost30d = agentTotals.reduce((s, a) => s + a.totalCost, 0);
+                    const totalTokens30d = agentTotals.reduce((s, a) => s + a.totalTokens, 0);
+                    const avgCostPerToken = totalTokens30d > 0 ? totalCost30d / totalTokens30d : 0;
 
-                        {/* Cost Over Time — Area Chart */}
-                        <div className="bg-gray-800/50 border border-gray-700 rounded-2xl p-6">
-                            <h3 className="text-xl font-bold mb-2">💸 Daily Cost Over Time (Last 30 Days)</h3>
-                            <p className="text-gray-500 text-sm mb-6">Aggregated from UsageLog records, per agent, per day.</p>
-                            {costTimeseries.length === 0 ? (
-                                <div className="text-center py-16 text-gray-500">
-                                    <p className="text-4xl mb-3">📉</p>
-                                    <p>No usage data yet. Chat with an agent in Test Flight to generate data.</p>
+                    // Smart cost formatter — adapts precision to value magnitude
+                    const formatCost = (v: number) => {
+                        if (v === 0) return '$0';
+                        if (Math.abs(v) >= 1) return `$${v.toFixed(2)}`;
+                        if (Math.abs(v) >= 0.01) return `$${v.toFixed(4)}`;
+                        return `$${v.toFixed(6)}`;
+                    };
+
+                    // Pie chart data for cost distribution
+                    const pieData = agentTotals.filter(a => a.totalCost > 0).map(a => ({
+                        name: a.agentName,
+                        value: a.totalCost,
+                    }));
+
+                    return (
+                        <div className="max-w-6xl mx-auto space-y-8">
+                            {/* Header */}
+                            <div className="flex justify-between items-center">
+                                <div>
+                                    <h2 className="text-3xl font-bold bg-gradient-to-r from-purple-400 via-cyan-400 to-pink-400 bg-clip-text text-transparent">Cost & Usage Analytics</h2>
+                                    <p className="text-gray-500 text-sm mt-1">Real-time cost tracking across all agents — last 30 days</p>
                                 </div>
-                            ) : (
-                                <ResponsiveContainer width="100%" height={350}>
-                                    <AreaChart data={(() => {
-                                        // Reshape data: pivot by date, with each agent as a separate key
-                                        const dateMap = new Map<string, any>();
-                                        for (const entry of costTimeseries) {
-                                            if (!dateMap.has(entry.date)) dateMap.set(entry.date, { date: entry.date });
-                                            const row = dateMap.get(entry.date);
-                                            row[entry.agentName] = (row[entry.agentName] || 0) + entry.totalCost;
-                                        }
-                                        return Array.from(dateMap.values());
-                                    })()}>
-                                        <defs>
-                                            <linearGradient id="colorGrad1" x1="0" y1="0" x2="0" y2="1">
-                                                <stop offset="5%" stopColor="#8b5cf6" stopOpacity={0.4} />
-                                                <stop offset="95%" stopColor="#8b5cf6" stopOpacity={0} />
-                                            </linearGradient>
-                                            <linearGradient id="colorGrad2" x1="0" y1="0" x2="0" y2="1">
-                                                <stop offset="5%" stopColor="#06b6d4" stopOpacity={0.4} />
-                                                <stop offset="95%" stopColor="#06b6d4" stopOpacity={0} />
-                                            </linearGradient>
-                                            <linearGradient id="colorGrad3" x1="0" y1="0" x2="0" y2="1">
-                                                <stop offset="5%" stopColor="#f59e0b" stopOpacity={0.4} />
-                                                <stop offset="95%" stopColor="#f59e0b" stopOpacity={0} />
-                                            </linearGradient>
-                                        </defs>
-                                        <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-                                        <XAxis dataKey="date" stroke="#9ca3af" tick={{ fontSize: 11 }} />
-                                        <YAxis stroke="#9ca3af" tick={{ fontSize: 11 }} tickFormatter={(v: number) => `$${v.toFixed(4)}`} />
-                                        <Tooltip
-                                            contentStyle={{ backgroundColor: '#1f2937', border: '1px solid #4b5563', borderRadius: '12px', color: '#fff' }}
-                                            formatter={(value: any) => [`$${Number(value).toFixed(6)}`, '']}
-                                        />
-                                        <Legend />
-                                        {agentTotals.map((agent, idx) => {
-                                            const colors = ['#8b5cf6', '#06b6d4', '#f59e0b', '#ec4899', '#10b981', '#f97316'];
-                                            const gradients = ['colorGrad1', 'colorGrad2', 'colorGrad3', 'colorGrad1', 'colorGrad2', 'colorGrad3'];
-                                            return (
+                                <button onClick={fetchCostTimeseries} className="px-5 py-2.5 bg-gray-800/80 hover:bg-gray-700 border border-gray-600 hover:border-purple-500/50 text-gray-300 hover:text-white rounded-xl text-sm transition-all flex items-center gap-2 group">
+                                    <span className="group-hover:rotate-180 transition-transform duration-500">🔄</span> Refresh
+                                </button>
+                            </div>
+
+                            {/* ── KPI Summary Cards ─────────────────────────── */}
+                            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5">
+                                {/* Card 1: Total Cost */}
+                                <div className="relative overflow-hidden bg-gradient-to-br from-gray-800/80 to-gray-900/80 backdrop-blur-xl border border-gray-700/50 p-6 rounded-2xl group hover:border-green-500/30 transition-all duration-300">
+                                    <div className="absolute top-0 right-0 w-24 h-24 bg-green-500/5 rounded-full -translate-y-1/2 translate-x-1/2 group-hover:bg-green-500/10 transition-colors" />
+                                    <div className="relative">
+                                        <div className="flex items-center gap-2 mb-3">
+                                            <span className="w-8 h-8 rounded-lg bg-green-500/10 border border-green-500/20 flex items-center justify-center text-sm">💰</span>
+                                            <h3 className="text-gray-400 text-xs font-semibold uppercase tracking-wider">Total Spend</h3>
+                                        </div>
+                                        <p className="text-3xl font-bold text-green-400 font-mono">{formatCost(totalCost30d)}</p>
+                                        <p className="text-[10px] text-gray-500 mt-2 font-mono">Last 30 days</p>
+                                    </div>
+                                </div>
+
+                                {/* Card 2: Total Tokens */}
+                                <div className="relative overflow-hidden bg-gradient-to-br from-gray-800/80 to-gray-900/80 backdrop-blur-xl border border-gray-700/50 p-6 rounded-2xl group hover:border-purple-500/30 transition-all duration-300">
+                                    <div className="absolute top-0 right-0 w-24 h-24 bg-purple-500/5 rounded-full -translate-y-1/2 translate-x-1/2 group-hover:bg-purple-500/10 transition-colors" />
+                                    <div className="relative">
+                                        <div className="flex items-center gap-2 mb-3">
+                                            <span className="w-8 h-8 rounded-lg bg-purple-500/10 border border-purple-500/20 flex items-center justify-center text-sm">⚡</span>
+                                            <h3 className="text-gray-400 text-xs font-semibold uppercase tracking-wider">Total Tokens</h3>
+                                        </div>
+                                        <p className="text-3xl font-bold text-purple-400 font-mono">{totalTokens30d.toLocaleString()}</p>
+                                        <p className="text-[10px] text-gray-500 mt-2 font-mono">across {agentTotals.length} agent{agentTotals.length !== 1 ? 's' : ''}</p>
+                                    </div>
+                                </div>
+
+                                {/* Card 3: Avg Cost per Token */}
+                                <div className="relative overflow-hidden bg-gradient-to-br from-gray-800/80 to-gray-900/80 backdrop-blur-xl border border-gray-700/50 p-6 rounded-2xl group hover:border-cyan-500/30 transition-all duration-300">
+                                    <div className="absolute top-0 right-0 w-24 h-24 bg-cyan-500/5 rounded-full -translate-y-1/2 translate-x-1/2 group-hover:bg-cyan-500/10 transition-colors" />
+                                    <div className="relative">
+                                        <div className="flex items-center gap-2 mb-3">
+                                            <span className="w-8 h-8 rounded-lg bg-cyan-500/10 border border-cyan-500/20 flex items-center justify-center text-sm">📐</span>
+                                            <h3 className="text-gray-400 text-xs font-semibold uppercase tracking-wider">Avg Cost / Token</h3>
+                                        </div>
+                                        <p className="text-3xl font-bold text-cyan-400 font-mono">{avgCostPerToken > 0 ? `$${avgCostPerToken.toExponential(2)}` : '—'}</p>
+                                        <p className="text-[10px] text-gray-500 mt-2 font-mono">efficiency metric</p>
+                                    </div>
+                                </div>
+
+                                {/* Card 4: Agents Tracked */}
+                                <div className="relative overflow-hidden bg-gradient-to-br from-gray-800/80 to-gray-900/80 backdrop-blur-xl border border-gray-700/50 p-6 rounded-2xl group hover:border-pink-500/30 transition-all duration-300">
+                                    <div className="absolute top-0 right-0 w-24 h-24 bg-pink-500/5 rounded-full -translate-y-1/2 translate-x-1/2 group-hover:bg-pink-500/10 transition-colors" />
+                                    <div className="relative">
+                                        <div className="flex items-center gap-2 mb-3">
+                                            <span className="w-8 h-8 rounded-lg bg-pink-500/10 border border-pink-500/20 flex items-center justify-center text-sm">🤖</span>
+                                            <h3 className="text-gray-400 text-xs font-semibold uppercase tracking-wider">Agents Tracked</h3>
+                                        </div>
+                                        <p className="text-3xl font-bold text-pink-400 font-mono">{agentTotals.length}</p>
+                                        <p className="text-[10px] text-gray-500 mt-2 font-mono">active in window</p>
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* ── Cost Over Time — Area Chart ─────────────── */}
+                            <div className="bg-gradient-to-br from-gray-800/60 to-gray-900/60 backdrop-blur-xl border border-gray-700/50 rounded-2xl p-6 hover:border-purple-500/20 transition-all duration-500">
+                                <div className="flex items-center gap-3 mb-2">
+                                    <span className="w-10 h-10 rounded-xl bg-gradient-to-br from-purple-500/20 to-pink-500/20 border border-purple-500/20 flex items-center justify-center">📈</span>
+                                    <div>
+                                        <h3 className="text-xl font-bold text-white">Daily Cost Trend</h3>
+                                        <p className="text-gray-500 text-xs">Per-agent spend aggregated by day</p>
+                                    </div>
+                                </div>
+                                {costTimeseries.length === 0 ? (
+                                    <div className="text-center py-20 text-gray-500">
+                                        <div className="text-5xl mb-4 opacity-30">📉</div>
+                                        <p className="text-sm">No usage data yet. Chat with an agent in <span className="text-purple-400">Test Flight</span> to generate data.</p>
+                                    </div>
+                                ) : (
+                                    <ResponsiveContainer width="100%" height={350}>
+                                        <AreaChart data={(() => {
+                                            const dateMap = new Map<string, any>();
+                                            for (const entry of costTimeseries) {
+                                                if (!dateMap.has(entry.date)) dateMap.set(entry.date, { date: entry.date });
+                                                const row = dateMap.get(entry.date);
+                                                row[entry.agentName] = (row[entry.agentName] || 0) + entry.totalCost;
+                                            }
+                                            return Array.from(dateMap.values());
+                                        })()}>
+                                            <defs>
+                                                {CHART_COLORS.map((color, i) => (
+                                                    <linearGradient key={`areaGrad${i}`} id={`areaGrad${i}`} x1="0" y1="0" x2="0" y2="1">
+                                                        <stop offset="5%" stopColor={color} stopOpacity={0.35} />
+                                                        <stop offset="95%" stopColor={color} stopOpacity={0.02} />
+                                                    </linearGradient>
+                                                ))}
+                                            </defs>
+                                            <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
+                                            <XAxis dataKey="date" stroke="#6b7280" tick={{ fontSize: 11 }} axisLine={{ stroke: '#374151' }} />
+                                            <YAxis stroke="#6b7280" tick={{ fontSize: 11 }} tickFormatter={formatCost} axisLine={{ stroke: '#374151' }} />
+                                            <Tooltip
+                                                contentStyle={{ backgroundColor: '#111827', border: '1px solid #374151', borderRadius: '16px', color: '#fff', boxShadow: '0 25px 50px -12px rgba(0,0,0,0.5)' }}
+                                                labelStyle={{ color: '#9ca3af', fontWeight: 600, marginBottom: 4 }}
+                                                formatter={(value: any, name?: string) => [formatCost(Number(value)), name || '']}
+                                            />
+                                            <Legend wrapperStyle={{ paddingTop: 16 }} />
+                                            {agentTotals.map((agent, idx) => (
                                                 <Area
                                                     key={agent.agentId}
                                                     type="monotone"
                                                     dataKey={agent.agentName}
-                                                    stroke={colors[idx % colors.length]}
+                                                    stroke={CHART_COLORS[idx % CHART_COLORS.length]}
+                                                    strokeWidth={2}
                                                     fillOpacity={1}
-                                                    fill={`url(#${gradients[idx % gradients.length]})`}
+                                                    fill={`url(#areaGrad${idx % CHART_COLORS.length})`}
+                                                    dot={false}
+                                                    activeDot={{ r: 5, strokeWidth: 2, stroke: '#111827' }}
                                                 />
-                                            );
-                                        })}
-                                    </AreaChart>
-                                </ResponsiveContainer>
-                            )}
-                        </div>
+                                            ))}
+                                        </AreaChart>
+                                    </ResponsiveContainer>
+                                )}
+                            </div>
 
-                        {/* Per-Agent Token Distribution — Bar Chart */}
-                        <div className="bg-gray-800/50 border border-gray-700 rounded-2xl p-6">
-                            <h3 className="text-xl font-bold mb-2">🧮 Per-Agent Token Distribution</h3>
-                            <p className="text-gray-500 text-sm mb-6">Total tokens consumed by each agent in the last 30 days.</p>
-                            {agentTotals.length === 0 ? (
-                                <div className="text-center py-16 text-gray-500">
-                                    <p className="text-4xl mb-3">📊</p>
-                                    <p>No token usage data yet.</p>
+                            {/* ── Charts Grid: Token Bar + Cost Pie ────────── */}
+                            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                                {/* Token Distribution — Bar Chart (FIXED: tokens only, no cost mixing) */}
+                                <div className="bg-gradient-to-br from-gray-800/60 to-gray-900/60 backdrop-blur-xl border border-gray-700/50 rounded-2xl p-6 hover:border-purple-500/20 transition-all duration-500">
+                                    <div className="flex items-center gap-3 mb-4">
+                                        <span className="w-10 h-10 rounded-xl bg-gradient-to-br from-purple-500/20 to-blue-500/20 border border-purple-500/20 flex items-center justify-center">⚡</span>
+                                        <div>
+                                            <h3 className="text-lg font-bold text-white">Token Usage by Agent</h3>
+                                            <p className="text-gray-500 text-xs">Total tokens consumed per agent</p>
+                                        </div>
+                                    </div>
+                                    {agentTotals.length === 0 ? (
+                                        <div className="text-center py-16 text-gray-500 text-sm">No data yet</div>
+                                    ) : (
+                                        <ResponsiveContainer width="100%" height={Math.max(200, agentTotals.length * 60)}>
+                                            <BarChart data={agentTotals} layout="vertical" margin={{ left: 10, right: 30 }}>
+                                                <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" horizontal={false} />
+                                                <XAxis type="number" stroke="#6b7280" tick={{ fontSize: 11 }} tickFormatter={(v: number) => v >= 1000 ? `${(v / 1000).toFixed(1)}k` : String(v)} />
+                                                <YAxis dataKey="agentName" type="category" stroke="#6b7280" tick={{ fontSize: 12, fill: '#d1d5db' }} width={110} />
+                                                <Tooltip
+                                                    contentStyle={{ backgroundColor: '#111827', border: '1px solid #374151', borderRadius: '16px', color: '#fff', boxShadow: '0 25px 50px -12px rgba(0,0,0,0.5)' }}
+                                                    formatter={(value: any) => [Number(value).toLocaleString(), 'Tokens']}
+                                                    cursor={{ fill: 'rgba(139, 92, 246, 0.08)' }}
+                                                />
+                                                <Bar dataKey="totalTokens" radius={[0, 8, 8, 0]} barSize={24}>
+                                                    {agentTotals.map((_entry, idx) => (
+                                                        <Cell key={idx} fill={CHART_COLORS[idx % CHART_COLORS.length]} fillOpacity={0.85} />
+                                                    ))}
+                                                </Bar>
+                                            </BarChart>
+                                        </ResponsiveContainer>
+                                    )}
                                 </div>
-                            ) : (
-                                <ResponsiveContainer width="100%" height={300}>
-                                    <BarChart data={agentTotals} layout="vertical">
-                                        <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-                                        <XAxis type="number" stroke="#9ca3af" tick={{ fontSize: 11 }} />
-                                        <YAxis dataKey="agentName" type="category" stroke="#9ca3af" tick={{ fontSize: 12 }} width={120} />
-                                        <Tooltip
-                                            contentStyle={{ backgroundColor: '#1f2937', border: '1px solid #4b5563', borderRadius: '12px', color: '#fff' }}
-                                            formatter={(value: any, name: any) => {
-                                                if (name === 'totalTokens') return [Number(value).toLocaleString(), 'Tokens'];
-                                                return [`$${Number(value).toFixed(6)}`, 'Cost (USD)'];
-                                            }}
-                                        />
-                                        <Legend />
-                                        <Bar dataKey="totalTokens" name="Tokens" fill="#8b5cf6" radius={[0, 6, 6, 0]} />
-                                        <Bar dataKey="totalCost" name="Cost ($)" fill="#06b6d4" radius={[0, 6, 6, 0]} />
-                                    </BarChart>
-                                </ResponsiveContainer>
-                            )}
-                        </div>
 
-                        {/* Summary Cards */}
-                        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                            <div className="bg-gray-800/50 border border-gray-700 p-6 rounded-2xl">
-                                <h3 className="text-gray-400 text-sm font-medium">Total Cost (30d)</h3>
-                                <p className="text-3xl font-bold text-green-400 mt-2">${agentTotals.reduce((s, a) => s + a.totalCost, 0).toFixed(6)}</p>
+                                {/* Cost Distribution — Pie Chart */}
+                                <div className="bg-gradient-to-br from-gray-800/60 to-gray-900/60 backdrop-blur-xl border border-gray-700/50 rounded-2xl p-6 hover:border-cyan-500/20 transition-all duration-500">
+                                    <div className="flex items-center gap-3 mb-4">
+                                        <span className="w-10 h-10 rounded-xl bg-gradient-to-br from-cyan-500/20 to-green-500/20 border border-cyan-500/20 flex items-center justify-center">🍩</span>
+                                        <div>
+                                            <h3 className="text-lg font-bold text-white">Cost Distribution</h3>
+                                            <p className="text-gray-500 text-xs">Proportional spend across agents</p>
+                                        </div>
+                                    </div>
+                                    {pieData.length === 0 ? (
+                                        <div className="text-center py-16 text-gray-500 text-sm">No cost data yet</div>
+                                    ) : (
+                                        <div className="flex flex-col items-center">
+                                            <ResponsiveContainer width="100%" height={250}>
+                                                <PieChart>
+                                                    <Pie
+                                                        data={pieData}
+                                                        cx="50%"
+                                                        cy="50%"
+                                                        innerRadius={60}
+                                                        outerRadius={100}
+                                                        paddingAngle={3}
+                                                        dataKey="value"
+                                                        stroke="#111827"
+                                                        strokeWidth={2}
+                                                    >
+                                                        {pieData.map((_entry, idx) => (
+                                                            <Cell key={idx} fill={CHART_COLORS[idx % CHART_COLORS.length]} />
+                                                        ))}
+                                                    </Pie>
+                                                    <Tooltip
+                                                        contentStyle={{ backgroundColor: '#111827', border: '1px solid #374151', borderRadius: '16px', color: '#fff', boxShadow: '0 25px 50px -12px rgba(0,0,0,0.5)' }}
+                                                        formatter={(value: any, name?: string) => [formatCost(Number(value)), name || '']}
+                                                    />
+                                                </PieChart>
+                                            </ResponsiveContainer>
+                                            {/* Pie Legend */}
+                                            <div className="flex flex-wrap justify-center gap-x-5 gap-y-2 mt-2">
+                                                {pieData.map((entry, idx) => (
+                                                    <div key={idx} className="flex items-center gap-2 text-xs">
+                                                        <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: CHART_COLORS[idx % CHART_COLORS.length] }} />
+                                                        <span className="text-gray-400">{entry.name}</span>
+                                                        <span className="text-gray-500 font-mono">{formatCost(entry.value)}</span>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
                             </div>
-                            <div className="bg-gray-800/50 border border-gray-700 p-6 rounded-2xl">
-                                <h3 className="text-gray-400 text-sm font-medium">Total Tokens (30d)</h3>
-                                <p className="text-3xl font-bold text-purple-400 mt-2">{agentTotals.reduce((s, a) => s + a.totalTokens, 0).toLocaleString()}</p>
-                            </div>
-                            <div className="bg-gray-800/50 border border-gray-700 p-6 rounded-2xl">
-                                <h3 className="text-gray-400 text-sm font-medium">Agents Tracked</h3>
-                                <p className="text-3xl font-bold text-cyan-400 mt-2">{agentTotals.length}</p>
+
+                            {/* ── Per-Agent Cost Table ────────────────────── */}
+                            <div className="bg-gradient-to-br from-gray-800/60 to-gray-900/60 backdrop-blur-xl border border-gray-700/50 rounded-2xl p-6 hover:border-green-500/20 transition-all duration-500">
+                                <div className="flex items-center gap-3 mb-4">
+                                    <span className="w-10 h-10 rounded-xl bg-gradient-to-br from-green-500/20 to-emerald-500/20 border border-green-500/20 flex items-center justify-center">📋</span>
+                                    <div>
+                                        <h3 className="text-lg font-bold text-white">Agent Cost Breakdown</h3>
+                                        <p className="text-gray-500 text-xs">Detailed per-agent spend, tokens, and cost-per-token</p>
+                                    </div>
+                                </div>
+                                {agentTotals.length === 0 ? (
+                                    <div className="text-center py-10 text-gray-500 text-sm">No data yet</div>
+                                ) : (
+                                    <div className="overflow-x-auto">
+                                        <table className="w-full text-left text-sm">
+                                            <thead>
+                                                <tr className="border-b border-gray-700/50">
+                                                    <th className="px-4 py-3 text-gray-400 font-semibold text-xs uppercase tracking-wider">Agent</th>
+                                                    <th className="px-4 py-3 text-gray-400 font-semibold text-xs uppercase tracking-wider text-right">Tokens</th>
+                                                    <th className="px-4 py-3 text-gray-400 font-semibold text-xs uppercase tracking-wider text-right">Cost (USD)</th>
+                                                    <th className="px-4 py-3 text-gray-400 font-semibold text-xs uppercase tracking-wider text-right">Cost/1k Tokens</th>
+                                                    <th className="px-4 py-3 text-gray-400 font-semibold text-xs uppercase tracking-wider">Share</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody className="divide-y divide-gray-800/50">
+                                                {agentTotals.map((ac, idx) => {
+                                                    const share = totalCost30d > 0 ? (ac.totalCost / totalCost30d) * 100 : 0;
+                                                    const costPer1k = ac.totalTokens > 0 ? (ac.totalCost / ac.totalTokens) * 1000 : 0;
+                                                    return (
+                                                        <tr key={ac.agentId} className="hover:bg-gray-800/40 transition-colors">
+                                                            <td className="px-4 py-4">
+                                                                <div className="flex items-center gap-3">
+                                                                    <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: CHART_COLORS[idx % CHART_COLORS.length] }} />
+                                                                    <span className="text-white font-medium">{ac.agentName}</span>
+                                                                </div>
+                                                            </td>
+                                                            <td className="px-4 py-4 text-right font-mono text-purple-300">{ac.totalTokens.toLocaleString()}</td>
+                                                            <td className="px-4 py-4 text-right font-mono text-green-400">{formatCost(ac.totalCost)}</td>
+                                                            <td className="px-4 py-4 text-right font-mono text-gray-400">{formatCost(costPer1k)}</td>
+                                                            <td className="px-4 py-4">
+                                                                <div className="flex items-center gap-2">
+                                                                    <div className="flex-1 h-2 bg-gray-800 rounded-full overflow-hidden max-w-[80px]">
+                                                                        <div className="h-full rounded-full transition-all" style={{ width: `${Math.min(share, 100)}%`, backgroundColor: CHART_COLORS[idx % CHART_COLORS.length] }} />
+                                                                    </div>
+                                                                    <span className="text-xs text-gray-500 font-mono w-10 text-right">{share.toFixed(1)}%</span>
+                                                                </div>
+                                                            </td>
+                                                        </tr>
+                                                    );
+                                                })}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                )}
                             </div>
                         </div>
-                    </div>
-                )}
+                    );
+                })()}
             </div>
         </div>
     );
