@@ -472,33 +472,89 @@ app.post<{ Params: { id: string } }>('/api/tasks/:id/approve', async (req, rep) 
         const task = await prisma.task.update({
             where: { id },
             data: { status: 'APPROVED' },
-            include: { agent: true } // Need agent details to resume
+            include: { agent: true }
         });
 
-        // ── SIGNAL: Publish RESUME message to Pub/Sub ─────────────────
-        const payload = {
-            type: 'RESUME',
-            taskId: task.id,
-            agentId: task.agentId,
-            traceId: randomUUID(),
-            action: 'APPROVED'
-        };
+        // ── INLINE EXECUTION: Execute the approved action directly ────
+        // (Cloud Run scales to zero so Pub/Sub pull subscriptions are unreliable)
+        const taskPayload = task.inputPayload as any;
+        let toolOutput = '';
 
-        const topic = pubsub.topic(TOPIC_NAME);
-        await topic.publishMessage({
-            data: Buffer.from(JSON.stringify(payload)),
-            attributes: {
-                source: 'governance-api',
-                traceId: payload.traceId
+        if (taskPayload) {
+            const emailRecipient = taskPayload.recipient || taskPayload.to;
+            const emailBody = taskPayload.body || taskPayload.message;
+
+            if (emailRecipient && taskPayload.subject && emailBody) {
+                // Real email sending via Gmail SMTP
+                console.log(`📧 Sending real email to ${emailRecipient}...`);
+                try {
+                    const transporter = nodemailer.createTransport({
+                        service: 'gmail',
+                        auth: {
+                            user: GMAIL_USER,
+                            pass: GMAIL_APP_PASSWORD,
+                        },
+                    });
+                    await transporter.sendMail({
+                        from: `"EGAP Agent" <${GMAIL_USER}>`,
+                        to: emailRecipient,
+                        subject: taskPayload.subject,
+                        text: emailBody,
+                        html: `<div style="font-family: sans-serif; padding: 20px;">
+                            <h2 style="color: #7c3aed;">📩 EGAP Agent Email</h2>
+                            <hr style="border-color: #e5e7eb;" />
+                            <p>${emailBody.replace(/\n/g, '<br>')}</p>
+                            <hr style="border-color: #e5e7eb;" />
+                            <p style="color: #9ca3af; font-size: 12px;">Sent by EGAP Command Plane on behalf of an AI agent.</p>
+                        </div>`,
+                    });
+                    console.log(`✅ Email successfully sent to ${emailRecipient}`);
+                    toolOutput = `[System] ✅ Email successfully sent to ${emailRecipient}`;
+                } catch (emailErr: any) {
+                    console.error(`❌ Email sending failed:`, emailErr.message);
+                    toolOutput = `[System] ❌ Email failed to send: ${emailErr.message}`;
+                }
+            } else {
+                toolOutput = `[System] ✅ Approved action executed: ${JSON.stringify(taskPayload)}`;
             }
-        });
-        console.log(`📢 Sent RESUME signal for Task ${task.id} (Agent ${task.agent.name})`);
-        // ─────────────────────────────────────────────────────────────
+        } else {
+            toolOutput = `[System] ✅ Task approved (no payload to execute).`;
+        }
 
-        return task;
+        // Update task to COMPLETED
+        await prisma.task.update({
+            where: { id },
+            data: { status: 'COMPLETED' }
+        });
+
+        // Save confirmation message to chat
+        if (task.agent) {
+            await prisma.message.create({
+                data: {
+                    agentId: task.agentId,
+                    role: 'assistant',
+                    content: toolOutput
+                }
+            });
+        }
+
+        console.log(`📢 Task ${task.id} approved and executed inline (Agent: ${task.agent?.name})`);
+
+        // Also publish RESUME to Pub/Sub as a fire-and-forget fallback (for local dev)
+        topic.publishMessage({
+            data: Buffer.from(JSON.stringify({
+                type: 'RESUME',
+                taskId: task.id,
+                agentId: task.agentId,
+                traceId: randomUUID(),
+                action: 'APPROVED'
+            })),
+        }).catch(() => { }); // Swallow errors
+
+        return { ...task, status: 'COMPLETED', executionResult: toolOutput };
     } catch (e) {
         console.error(e);
-        return rep.status(404).send({ error: 'Task not found or failed to signal' });
+        return rep.status(404).send({ error: 'Task not found or failed to execute' });
     }
 });
 
@@ -786,7 +842,26 @@ async function processChat(data: { type: string; agentId: string; message: strin
         // ── DYNAMIC TOOL COMPILATION ─────────────────────────────────
         const dynamicFunctionDeclarations = agent.tools.map((t: any) => {
             const config: any = t.configuration;
-            return { name: t.name, description: t.description, parameters: config?.parameters || {} };
+            let parameters = config?.parameters || {};
+            let description = t.description;
+
+            // Inject proper schema and description for send_email if missing
+            if (t.name === 'send_email') {
+                if (!parameters || !parameters.properties) {
+                    parameters = {
+                        type: 'OBJECT',
+                        properties: {
+                            to: { type: 'STRING', description: 'Recipient email address' },
+                            subject: { type: 'STRING', description: 'Email subject line' },
+                            body: { type: 'STRING', description: 'Email body text' },
+                        },
+                        required: ['to', 'subject', 'body'],
+                    };
+                }
+                description = 'Send an email. Required parameters: to (email address), subject (email subject), body (email body text).';
+            }
+
+            return { name: t.name, description: description || `Execute the ${t.name} tool`, parameters };
         });
 
         const dynamicTools = dynamicFunctionDeclarations.length > 0 ? [{ functionDeclarations: dynamicFunctionDeclarations }] : [];
@@ -864,8 +939,12 @@ async function processChat(data: { type: string; agentId: string; message: strin
         const firstCandidate = candidates?.[0];
         let firstPart = firstCandidate?.content?.parts?.[0];
 
+        // 🔍 Scan ALL parts for a functionCall (LLM may put it in parts[1+])
+        const allParts = firstCandidate?.content?.parts || [];
+        let functionCallPart = allParts.find((p: any) => p.functionCall);
+
         // 🚨 FALLBACK: Handle UNEXPECTED_TOOL_CALL
-        if (firstCandidate?.finishReason === 'UNEXPECTED_TOOL_CALL' && firstCandidate?.finishMessage) {
+        if (!functionCallPart && firstCandidate?.finishReason === 'UNEXPECTED_TOOL_CALL' && firstCandidate?.finishMessage) {
             const rawMsg = firstCandidate.finishMessage;
             const match = rawMsg.match(/print\(([\w_]+)\((.*)\)\)/);
             if (match) {
@@ -874,14 +953,14 @@ async function processChat(data: { type: string; agentId: string; message: strin
                 const args: any = {};
                 const argMatches = argsStr.matchAll(/(\w+)=['"]([\s\S]*?)['"]/g);
                 for (const m of argMatches) { args[m[1]] = m[2]; }
-                firstPart = { functionCall: { name: fnName, args } };
+                functionCallPart = { functionCall: { name: fnName, args } };
             }
         }
 
         // ── FUNCTION CALLING ─────────────────────────────────────────
         // @ts-ignore
-        if (firstPart?.functionCall) {
-            const fn = firstPart.functionCall;
+        if (functionCallPart?.functionCall) {
+            const fn = functionCallPart.functionCall;
             console.log(`⚡️ Agent wants to call tool: ${fn.name}`);
 
             if (fn.name === 'send_email') {
@@ -891,6 +970,21 @@ async function processChat(data: { type: string; agentId: string; message: strin
                 await prisma.message.create({ data: { agentId: agent.id, role: 'assistant', content: `[System] Usage of tool '${fn.name}' requires Admin Approval. Task ${task.id} created.`, tokens: totalTokens, cost } });
                 await prisma.usageLog.create({ data: { agentId: agent.id, action: `tool_intercept_${fn.name}`, tokens: totalTokens, costUsd: cost } });
                 console.log(`🔒 Task ${task.id} created. Suspending execution.`);
+                // Notify all connected WebSocket clients about the new HITL task
+                for (const [, socket] of activeConnections) {
+                    try {
+                        socket.send(JSON.stringify({
+                            type: 'hitl_task_created',
+                            task: {
+                                id: task.id,
+                                description: task.description,
+                                status: 'PENDING',
+                                agentId: agent.id,
+                                agentName: agent.name,
+                            }
+                        }));
+                    } catch (e) { /* ignore dead sockets */ }
+                }
                 return;
             }
 
@@ -973,10 +1067,11 @@ async function handleMessage(message: Message): Promise<void> {
 
             // Execute Action
             let toolOutput = '';
-            if ((payload.to || payload.recipient) && payload.subject && payload.body) {
-                const emailTo = payload.to || payload.recipient;
+            const emailRecipient = payload.recipient || payload.to;
+            if (emailRecipient && payload.subject && (payload.body || payload.message)) {
+                const emailBody = payload.body || payload.message;
                 // Real email sending via Gmail SMTP
-                console.log(`📧 Sending real email to ${emailTo}...`);
+                console.log(`📧 Sending real email to ${emailRecipient}...`);
                 try {
                     const transporter = nodemailer.createTransport({
                         service: 'gmail',
@@ -987,19 +1082,19 @@ async function handleMessage(message: Message): Promise<void> {
                     });
                     await transporter.sendMail({
                         from: `"EGAP Agent" <${GMAIL_USER}>`,
-                        to: emailTo,
+                        to: emailRecipient,
                         subject: payload.subject,
-                        text: payload.body,
+                        text: emailBody,
                         html: `<div style="font-family: sans-serif; padding: 20px;">
                             <h2 style="color: #7c3aed;">📩 EGAP Agent Email</h2>
                             <hr style="border-color: #e5e7eb;" />
-                            <p>${payload.body.replace(/\n/g, '<br>')}</p>
+                            <p>${emailBody.replace(/\n/g, '<br>')}</p>
                             <hr style="border-color: #e5e7eb;" />
                             <p style="color: #9ca3af; font-size: 12px;">Sent by EGAP Command Plane on behalf of an AI agent.</p>
                         </div>`,
                     });
-                    console.log(`✅ Email successfully sent to ${emailTo}`);
-                    toolOutput = `[System] ✅ Email successfully sent to ${emailTo}`;
+                    console.log(`✅ Email successfully sent to ${emailRecipient}`);
+                    toolOutput = `[System] ✅ Email successfully sent to ${emailRecipient}`;
                 } catch (emailErr: any) {
                     console.error(`❌ Email sending failed:`, emailErr.message);
                     toolOutput = `[System] ❌ Email failed to send: ${emailErr.message}`;

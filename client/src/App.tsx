@@ -117,6 +117,11 @@ function App() {
     }, []);
 
     useEffect(() => {
+        // Immediately fetch data when switching to a tab (no 3s delay)
+        if (activeTab === 'govern') fetchTasks();
+        if (activeTab === 'observe') { fetchStats(); fetchReconciliation(); }
+        if (activeTab === 'analytics') fetchCostTimeseries();
+
         const interval = setInterval(() => {
             if (activeTab === 'test' && selectedAgentId) fetchMessages();
             if (activeTab === 'observe') { fetchStats(); fetchReconciliation(); }
@@ -140,6 +145,10 @@ function App() {
                 const data = JSON.parse(event.data);
                 if (data.type === 'thought_chunk') {
                     setStreamingContent(prev => prev + data.text);
+                }
+                if (data.type === 'hitl_task_created') {
+                    fetchTasks(); // Refresh tasks immediately
+                    setSuccessMessage(`🔒 HITL Approval Required: ${data.task?.description || 'New task pending'}`);
                 }
             } catch (e) { console.error('WS Parse Error', e); }
         };
