@@ -676,16 +676,9 @@ app.post<{ Params: { id: string } }>('/api/tasks/:id/approve', async (req, rep) 
 
         console.log(`📢 Task ${task.id} approved and executed inline (Agent: ${task.agent?.name})`);
 
-        // Also publish RESUME to Pub/Sub as a fire-and-forget fallback (for local dev)
-        topic.publishMessage({
-            data: Buffer.from(JSON.stringify({
-                type: 'RESUME',
-                taskId: task.id,
-                agentId: task.agentId,
-                traceId: randomUUID(),
-                action: 'APPROVED'
-            })),
-        }).catch(() => { }); // Swallow errors
+        // NOTE: Removed Pub/Sub RESUME publish — the email is already sent inline above.
+        // Publishing RESUME here caused duplicate email sends because the Pub/Sub handler
+        // also executes the same email logic.
 
         return { ...task, status: 'COMPLETED', executionResult: toolOutput };
     } catch (e) {
@@ -1299,6 +1292,13 @@ async function handleMessage(message: Message): Promise<void> {
             const task = await prisma.task.findUnique({ where: { id: taskId } });
             if (!task || !task.inputPayload) {
                 console.error(`❌ Task ${taskId} missing or has no payload.`);
+                message.ack();
+                return;
+            }
+
+            // Guard: skip tasks already completed (e.g. already executed inline by the approve endpoint)
+            if (task.status === 'COMPLETED') {
+                console.log(`⏭️ Task ${taskId} already COMPLETED. Skipping duplicate execution.`);
                 message.ack();
                 return;
             }
