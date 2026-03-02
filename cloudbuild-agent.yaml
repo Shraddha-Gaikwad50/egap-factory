@@ -1,0 +1,43 @@
+steps:
+  # 1. Build the Generic Agent Engine Image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/agent-engine-${_AGENT_NAME_SLUG}'
+      - '-f'
+      - 'services/agent-engine/Dockerfile'
+      - '.'
+
+  # 2. Push the Image to GCR
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/$PROJECT_ID/agent-engine-${_AGENT_NAME_SLUG}'
+
+  # 3. Deploy the new image to Cloud Run as a dedicated service
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'agent-${_AGENT_NAME_SLUG}'
+      - '--image'
+      - 'gcr.io/$PROJECT_ID/agent-engine-${_AGENT_NAME_SLUG}'
+      - '--region'
+      - '${_REGION}'
+      - '--platform'
+      - 'managed'
+      - '--allow-unauthenticated'
+      - '--set-env-vars'
+      - 'AGENT_ID=${_AGENT_ID},PROJECT_ID=$PROJECT_ID,GMAIL_USER=${_GMAIL_USER},GMAIL_APP_PASSWORD=${_GMAIL_APP_PASSWORD}'
+      - '--service-account'
+      - '${_COMPUTE_SERVICE_ACCOUNT}'
+
+substitutions:
+  _AGENT_ID: 'default-id'               # The UUID from the database
+  _AGENT_NAME_SLUG: 'default-agent'       # A URL-safe slug for the service name
+  _REGION: 'asia-south1'                 # Same region as the orchestration
+  _COMPUTE_SERVICE_ACCOUNT: ''            # Service account to run the Cloud Run service
+  _GMAIL_USER: ''
+  _GMAIL_APP_PASSWORD: ''

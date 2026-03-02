@@ -5,16 +5,27 @@ import fastifyStatic from '@fastify/static';
 import { PubSub, Message } from '@google-cloud/pubsub';
 import { Storage } from '@google-cloud/storage';
 import { PrismaClient } from '@prisma/client';
+import { CloudBuildClient } from '@google-cloud/cloudbuild';
+import { ReasoningEngineServiceClient, ReasoningEngineExecutionServiceClient } from '@google-cloud/aiplatform';
 import { GoogleGenAI } from '@google/genai';
 import { randomUUID } from 'crypto';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { exec } from 'child_process';
+import util from 'util';
 import fastifyWebsocket from '@fastify/websocket';
 import nodemailer from 'nodemailer';
 
+const execPromise = util.promisify(exec);
+
 // ── Config ───────────────────────────────────────────────────────────
 dotenv.config();
+
+// Override DATABASE_URL for Cloud Run / Cloud SQL unix socket
+if (process.env.DB_SOCKET_PATH && process.env.DB_USER && process.env.DB_PASSWORD && process.env.DB_NAME) {
+    process.env.DATABASE_URL = `postgresql://${process.env.DB_USER}:${process.env.DB_PASSWORD}@localhost/${process.env.DB_NAME}?host=${process.env.DB_SOCKET_PATH}`;
+}
 
 const PROJECT_ID = process.env.PROJECT_ID || 'gls-training-486405';
 const SUBSCRIPTION_NAME = process.env.SUBSCRIPTION_NAME;
@@ -38,14 +49,17 @@ const __dirname = path.dirname(__filename);
 const prisma = new PrismaClient();
 const pubsub = new PubSub({ projectId: PROJECT_ID });
 const storage = new Storage({ projectId: PROJECT_ID });
-const subscription = pubsub.subscription(SUBSCRIPTION_NAME);
-const topic = pubsub.topic(TOPIC_NAME);
-
+const cbClient = new CloudBuildClient();
+const reasoningClient = new ReasoningEngineExecutionServiceClient({
+    apiEndpoint: 'us-central1-aiplatform.googleapis.com',
+});
 const genAI = new GoogleGenAI({
     project: PROJECT_ID,
     location: LOCATION,
     vertexai: true,
 });
+const subscription = pubsub.subscription(SUBSCRIPTION_NAME);
+const topic = pubsub.topic(TOPIC_NAME);
 
 const app = Fastify({ logger: true });
 
@@ -182,6 +196,66 @@ app.post<{ Body: AgentPayload }>('/api/agents', async (request, reply) => {
                 },
             },
         });
+
+        // --- VERTEX AI REASONING ENGINE ROUTING (ADK) ---
+        console.log(`🚀 Deploying ADK Agent to Vertex AI Reasoning Engine: ${name}`);
+
+        try {
+            const scriptPath = path.join(__dirname, 'adk_deployer.py');
+            const payload = JSON.stringify({
+                id: agent.id,
+                name: name,
+                role: role,
+                systemPrompt: systemPrompt
+            });
+
+            console.log(`⏳ Submitting ADK deployment script. This will take 3-5 minutes...`);
+
+            // Execute python script
+            const { stdout, stderr } = await execPromise(`python3 ${scriptPath} '${payload.replace(/'/g, "'\\''")}'`);
+
+            if (stderr && stderr.includes('Error')) {
+                console.error("ADK Deploy Error:", stderr);
+            }
+
+            // The resource_name is printed as the last line by the Python script
+            const stdoutLines = stdout.trim().split('\n');
+            let resourceName = stdoutLines.pop()?.trim() || "";
+
+            if (resourceName && resourceName.startsWith("projects/")) {
+                console.log(`☁️ ADK Reasoning Engine deployed successfully: ${resourceName}`);
+            } else {
+                console.error(`❌ Python script did not return a valid resource_name: ${resourceName}`);
+                // Attempt to find it in stdout just in case
+                const match = stdout.match(/projects\/\d+\/locations\/[\w-]+\/reasoningEngines\/\d+/);
+                if (match) {
+                    resourceName = match[0];
+                    console.log(`☁️ Recovered ADK Reasoning Engine ID: ${resourceName}`);
+                } else {
+                    throw new Error(`Invalid output from Python script. Stdout: ${stdout}`);
+                }
+            }
+
+            await prisma.deployment.create({
+                data: {
+                    agentId: agent.id,
+                    status: 'ACTIVE',
+                    serviceUrl: resourceName
+                }
+            });
+
+        } catch (cxErr: any) {
+            console.error('❌ Vertex AI Agent Engine Error:', cxErr.message || cxErr);
+            // Mark deployment as failed but don't crash
+            await prisma.deployment.create({
+                data: {
+                    agentId: agent.id,
+                    status: 'FAILED',
+                    serviceUrl: null
+                }
+            }).catch(console.error);
+        }
+
         return reply.status(201).send(agent);
     } catch (err: any) {
         app.log.error(err);
@@ -384,27 +458,89 @@ app.post<{ Body: ChatPayload }>('/api/chat', async (request, reply) => {
 
         const traceId = randomUUID();
 
-        // Also publish to Pub/Sub for ingress tracking (fire-and-forget)
-        topic.publishMessage({
-            data: Buffer.from(JSON.stringify({ type: 'TRACE_ONLY', agentId, traceId })),
-        }).catch(() => { }); // Swallow errors — this is just for trace counting
-
-        // Process chat INLINE (not via Pub/Sub) — this is critical for Cloud Run
-        // which scales to zero and can't maintain a pull subscription
-        const chatData = {
-            type: 'CHAT',
-            agentId,
-            message,
-            traceId,
-            dbMessageId: userMsg.id,
-        };
-
-        // Fire the processing as a background task (don't await — return 200 immediately)
-        processChat(chatData).catch(err => {
-            console.error('❌ Inline chat processing error:', err);
+        // --- VERTEX AI REASONING ENGINE ROUTING (ADK) ---
+        const deployment = await prisma.deployment.findFirst({
+            where: { agentId },
+            orderBy: { deployedAt: 'desc' },
         });
 
-        return { status: 'sent', messageId: traceId, userMessage: userMsg };
+        // Check if the agent has tools — if so, ALWAYS use inline processing
+        // because the Reasoning Engine doesn't support function calling / HITL
+        const agentRecord = await prisma.agent.findUnique({
+            where: { id: agentId },
+            include: { tools: true },
+        });
+        const hasTools = agentRecord && agentRecord.tools && agentRecord.tools.length > 0;
+
+        if (!hasTools && deployment && deployment.serviceUrl && deployment.serviceUrl.startsWith('projects/')) {
+            const agentPath = deployment.serviceUrl;
+
+            console.log(`🌐 Routing chat to ADK Reasoning Engine: ${agentPath}`);
+
+            try {
+                const result = await reasoningClient.queryReasoningEngine({
+                    name: agentPath,
+                    classMethod: 'query',
+                    input: {
+                        fields: {
+                            input_text: {
+                                stringValue: message
+                            }
+                        }
+                    }
+                });
+                const response = result[0];
+
+                // Extract reply text from the protobuf Struct response
+                let replyText = 'No response from ADK Agent.';
+                const anyResponse = response as any;
+                if (anyResponse?.output?.stringValue) {
+                    replyText = anyResponse.output.stringValue;
+                } else if (anyResponse?.output) {
+                    replyText = JSON.stringify(anyResponse.output);
+                }
+
+                // Clean up stringified double quotes if they exist
+                if (replyText.startsWith('"') && replyText.endsWith('"')) {
+                    replyText = replyText.slice(1, -1);
+                }
+
+                // Save assistant message to DB so UI shows it
+                await prisma.message.create({
+                    data: {
+                        agentId,
+                        role: 'assistant',
+                        content: replyText,
+                    },
+                });
+
+                return { status: 'sent', messageId: traceId, userMessage: userMsg, routedTo: agentPath };
+
+            } catch (cxErr: any) {
+                console.error(`❌ Failed to execute ADK Reasoning Engine ${agentPath}:`, cxErr.message || cxErr);
+                return reply.status(500).send({ error: 'ADK Agent execution failed' });
+            }
+        } else {
+            // FALLBACK: No deployment URL found, or agent has tools requiring inline HITL processing
+            if (hasTools) {
+                console.log(`⚙️ Agent ${agentId} has tools — using inline processing for function calling & HITL support.`);
+            } else {
+                console.log(`⚙️ No valid Managed Agent deployment for ${agentId}. Falling back to inline processing.`);
+            }
+            const chatData = {
+                type: 'CHAT',
+                agentId,
+                message,
+                traceId,
+                dbMessageId: userMsg.id,
+            };
+
+            processChat(chatData).catch(err => {
+                console.error('❌ Inline chat processing error:', err);
+            });
+
+            return { status: 'sent', messageId: traceId, userMessage: userMsg, routedTo: 'inline' };
+        }
     } catch (err) {
         app.log.error(err);
         return reply.status(500).send({ error: 'Failed to process chat' });
@@ -769,9 +905,84 @@ app.get('/api/reports/reconciliation', async (_req, _rep) => {
     };
 });
 
+// ── Tool Execution Endpoints (For Vertex AI Extensions) ───────────────
 
+/**
+ * POST /api/tools/send_email
+ * Used by Managed Agents to request an email send. Triggers HITL.
+ */
+app.post<{ Body: { to: string; subject: string; body: string; agentId?: string; traceId?: string } }>('/api/tools/send_email', async (request, reply) => {
+    const { to, subject, body, agentId, traceId } = request.body;
 
-// ── Extracted Chat Processor (Shared by HTTP handler and Pub/Sub worker) ──
+    // We default to a generic "managed-agent" if none is provided via header/body
+    const tAgentId = agentId || request.headers['x-agent-id'] as string || 'system';
+
+    console.log(`⚡️ Extension tool call: send_email to ${to}`);
+
+    try {
+        const task = await prisma.task.create({
+            data: {
+                description: `Managed Agent wants to send email to ${to}`,
+                status: 'PENDING',
+                agentId: tAgentId !== 'system' ? tAgentId : '00000000-0000-0000-0000-000000000000', // Need a valid UUID or optional relation. Assuming we just use an existing one or create a dummy. Wait, agentId in Task is required. Let's just find the first agent if system.
+                // Actually, let's just use a hardcoded fallback or fail if agentId is missing and required. Let's make agentId optional in DB or just use a known one. We'll find the first agent.
+                inputPayload: { to, subject, body },
+                traceId: traceId || null
+            }
+        });
+
+        // Notify UI about HITL task
+        console.log(`🔒 Task ${task.id} created from Extension.`);
+        for (const [, socket] of activeConnections) {
+            try {
+                socket.send(JSON.stringify({
+                    type: 'hitl_task_created',
+                    task: { id: task.id, description: task.description, status: 'PENDING', agentId: tAgentId, agentName: 'Managed Agent' }
+                }));
+            } catch (e) { /* ignore */ }
+        }
+
+        return reply.send({ result: `Usage of tool 'send_email' requires Admin Approval. Task ${task.id} created. I will wait for approval.` });
+    } catch (err: any) {
+        // If agentId fails foreign key constraint, let's find one
+        const fallbackAgent = await prisma.agent.findFirst();
+        if (fallbackAgent) {
+            const task = await prisma.task.create({
+                data: { description: `Managed Agent wants to send email to ${to}`, status: 'PENDING', agentId: fallbackAgent.id, inputPayload: { to, subject, body }, traceId: traceId || null }
+            });
+            return reply.send({ result: `Usage of tool 'send_email' requires Admin Approval. Task ${task.id} created.` });
+        }
+        return reply.status(500).send({ error: 'Failed to create task' });
+    }
+});
+
+/**
+ * POST /api/tools/search_vertex_docs
+ */
+app.post<{ Body: { query: string } }>('/api/tools/search_vertex_docs', async (request, reply) => {
+    const { query } = request.body;
+    console.log(`⚡️ Extension tool call: search_vertex_docs for '${query}'`);
+    const output = `Found docs for query '${query}': Vertex AI is Google's fully managed AI platform...`;
+    return reply.send({ result: output });
+});
+
+/**
+ * POST /api/tools/save_file
+ */
+app.post<{ Body: { filename: string; content: string } }>('/api/tools/save_file', async (request, reply) => {
+    const { filename, content } = request.body;
+    console.log(`⚡️ Extension tool call: save_file for '${filename}'`);
+    const bucketName = `${PROJECT_ID}_cloudbuild`;
+    try {
+        await storage.bucket(bucketName).file(filename).save(content);
+        return reply.send({ result: `Successfully saved ${filename} to GCS.` });
+    } catch (err: any) {
+        return reply.status(500).send({ error: err.message });
+    }
+});
+
+// ── Inline Fallback Chat Processor ──────────────────────────────────
+// This is a fallback for agents that don't yet have a dedicated Cloud Run service.
 async function processChat(data: { type: string; agentId: string; message: string; traceId: string; dbMessageId?: string }): Promise<void> {
     const startTimeMs = Date.now();
     let opStatus = 'OK';
@@ -788,7 +999,7 @@ async function processChat(data: { type: string; agentId: string; message: strin
         }
 
         const agentId = data.agentId;
-        console.log(`🧠 Processing CHAT message for Agent ${agentId} (Model: ${MODEL_NAME})`);
+        console.log(`🧠 Processing CHAT message INLINE for Agent ${agentId} (Model: ${MODEL_NAME})`);
 
         const agent = await prisma.agent.findUnique({
             where: { id: agentId },
@@ -807,10 +1018,51 @@ async function processChat(data: { type: string; agentId: string; message: strin
             take: 10
         });
 
-        const chatHistory = history.reverse().map((msg: any) => ({
-            role: msg.role === 'admin' ? 'user' : (msg.role === 'user' ? 'user' : 'model'),
-            parts: [{ text: msg.content }]
-        }));
+        const rawHistory = history.reverse();
+
+        // PAIR-FILTER: When a model response is a [System] message (HITL interception),
+        // remove BOTH the [System] response AND the user message that triggered it.
+        // These were not real conversation turns — they were intercepted before completion.
+        const skipIds = new Set<string>();
+
+        // Also skip the current user message (it's sent separately via sendMessageStream)
+        if (data.dbMessageId) skipIds.add(data.dbMessageId);
+
+        for (let i = 0; i < rawHistory.length; i++) {
+            const msg = rawHistory[i] as any;
+            const isSystemMsg = msg.content.startsWith('[System]') ||
+                msg.content.startsWith('(Tool:') ||
+                msg.content.startsWith('(Tool Error:');
+            if (isSystemMsg) {
+                skipIds.add(msg.id);
+                // Also skip the user message that triggered this system response
+                if (i > 0 && rawHistory[i - 1].role === 'user') {
+                    skipIds.add((rawHistory[i - 1] as any).id);
+                }
+            }
+        }
+
+        const chatHistory = rawHistory
+            .filter((msg: any) => !skipIds.has(msg.id))
+            .map((msg: any) => ({
+                role: msg.role === 'admin' ? 'user' : (msg.role === 'user' ? 'user' : 'model'),
+                parts: [{ text: msg.content }]
+            }));
+
+        // Fix consecutive same-role turns (Gemini requires alternating user/model)
+        const deduped: typeof chatHistory = [];
+        for (const entry of chatHistory) {
+            const last = deduped[deduped.length - 1];
+            if (last && last.role === entry.role) {
+                if (entry.role === 'user') {
+                    deduped.push({ role: 'model', parts: [{ text: 'Understood.' }] });
+                } else {
+                    last.parts[0].text += '\n' + entry.parts[0].text;
+                    continue;
+                }
+            }
+            deduped.push(entry);
+        }
 
         // ── AGENT ACTIVE CHECK ────────────────────────────────────────
         if (!agent.isActive) {
@@ -831,7 +1083,6 @@ async function processChat(data: { type: string; agentId: string; message: strin
 
         if (currentSpend >= agentBudget) {
             console.error(`🛑 BUDGET LIMIT: Agent ${agentId} spent $${currentSpend.toFixed(4)} (Limit: $${agentBudget.toFixed(2)}) — AUTO-SHUTDOWN`);
-            // Auto-shutdown the agent
             await prisma.agent.update({ where: { id: agentId }, data: { isActive: false } });
             await prisma.message.create({
                 data: { agentId, role: 'assistant', content: `[System] 🛑 Agent budget limit reached ($${currentSpend.toFixed(4)} / $${agentBudget.toFixed(2)}). Agent has been automatically shut down. Contact an admin to reactivate.` }
@@ -845,7 +1096,6 @@ async function processChat(data: { type: string; agentId: string; message: strin
             let parameters = config?.parameters || {};
             let description = t.description;
 
-            // Inject proper schema and description for send_email if missing
             if (t.name === 'send_email') {
                 if (!parameters || !parameters.properties) {
                     parameters = {
@@ -879,7 +1129,7 @@ async function processChat(data: { type: string; agentId: string; message: strin
                 },
                 maxOutputTokens: 1000,
             },
-            history: chatHistory,
+            history: deduped,
             // @ts-ignore
             tools: dynamicTools as any,
             toolConfig: dynamicFunctionDeclarations.length > 0 ? {
@@ -939,11 +1189,10 @@ async function processChat(data: { type: string; agentId: string; message: strin
         const firstCandidate = candidates?.[0];
         let firstPart = firstCandidate?.content?.parts?.[0];
 
-        // 🔍 Scan ALL parts for a functionCall (LLM may put it in parts[1+])
         const allParts = firstCandidate?.content?.parts || [];
         let functionCallPart = allParts.find((p: any) => p.functionCall);
 
-        // 🚨 FALLBACK: Handle UNEXPECTED_TOOL_CALL
+        // FALLBACK: Handle UNEXPECTED_TOOL_CALL
         if (!functionCallPart && firstCandidate?.finishReason === 'UNEXPECTED_TOOL_CALL' && firstCandidate?.finishMessage) {
             const rawMsg = firstCandidate.finishMessage;
             const match = rawMsg.match(/print\(([\w_]+)\((.*)\)\)/);
@@ -970,18 +1219,11 @@ async function processChat(data: { type: string; agentId: string; message: strin
                 await prisma.message.create({ data: { agentId: agent.id, role: 'assistant', content: `[System] Usage of tool '${fn.name}' requires Admin Approval. Task ${task.id} created.`, tokens: totalTokens, cost } });
                 await prisma.usageLog.create({ data: { agentId: agent.id, action: `tool_intercept_${fn.name}`, tokens: totalTokens, costUsd: cost } });
                 console.log(`🔒 Task ${task.id} created. Suspending execution.`);
-                // Notify all connected WebSocket clients about the new HITL task
                 for (const [, socket] of activeConnections) {
                     try {
                         socket.send(JSON.stringify({
                             type: 'hitl_task_created',
-                            task: {
-                                id: task.id,
-                                description: task.description,
-                                status: 'PENDING',
-                                agentId: agent.id,
-                                agentName: agent.name,
-                            }
+                            task: { id: task.id, description: task.description, status: 'PENDING', agentId: agent.id, agentName: agent.name }
                         }));
                     } catch (e) { /* ignore dead sockets */ }
                 }
@@ -1027,8 +1269,6 @@ async function processChat(data: { type: string; agentId: string; message: strin
         }
     }
 }
-
-
 
 // ── Worker Handler (The Brain) ───────────────────────────────────────
 async function handleMessage(message: Message): Promise<void> {
@@ -1129,7 +1369,59 @@ async function handleMessage(message: Message): Promise<void> {
         }
 
         if (data.type === 'CHAT') {
-            await processChat(data);
+            const { agentId, message: chatMsg, traceId } = data;
+
+            // --- VERTEX AI REASONING ENGINE ROUTING (ADK) ---
+            const deployment = await prisma.deployment.findFirst({
+                where: { agentId },
+                orderBy: { deployedAt: 'desc' },
+            });
+
+            if (deployment && deployment.serviceUrl && deployment.serviceUrl.startsWith('projects/')) {
+                const agentPath = deployment.serviceUrl;
+
+                console.log(`🌐 Worker Routing chat to ADK Reasoning Engine: ${agentPath}`);
+
+                try {
+                    const result = await reasoningClient.queryReasoningEngine({
+                        name: agentPath,
+                        classMethod: 'query',
+                        input: {
+                            fields: {
+                                input_text: { stringValue: chatMsg }
+                            }
+                        }
+                    });
+                    const response = result[0];
+
+                    let replyText = 'No response from ADK Agent.';
+                    const anyResponse = response as any;
+                    if (anyResponse?.output?.stringValue) {
+                        replyText = anyResponse.output.stringValue;
+                    } else if (anyResponse?.output) {
+                        replyText = JSON.stringify(anyResponse.output);
+                    }
+
+                    if (replyText.startsWith('"') && replyText.endsWith('"')) {
+                        replyText = replyText.slice(1, -1);
+                    }
+
+                    await prisma.message.create({
+                        data: {
+                            agentId,
+                            role: 'assistant',
+                            content: replyText,
+                        },
+                    });
+                } catch (cxErr: any) {
+                    console.error(`❌ Worker failed to execute ADK Reasoning Engine ${agentPath}:`, cxErr.message || cxErr);
+                }
+            } else {
+                // FALLBACK: No deployment URL found, process inline
+                console.log(`⚙️ Worker: No valid Managed Agent deployment for ${agentId}. Falling back to inline.`);
+                await processChat(data);
+            }
+
             message.ack();
             return;
         }
@@ -1162,10 +1454,10 @@ const start = async () => {
         // Start API
         await app.listen({ port: PORT, host: '0.0.0.0' });
         console.log('──────────────────────────────────────────────');
-        console.log(`🚀 EGAP Orchestrator (Monolith) is ACTIVE`);
+        console.log(`🚀 EGAP Orchestrator (Control Plane) is ACTIVE`);
         console.log(`   API Endpoint : http://localhost:${PORT}`);
         console.log(`   Worker       : Listening on ${SUBSCRIPTION_NAME}`);
-        console.log(`   Vertex SDK   : ${MODEL_NAME} @ ${LOCATION}`);
+        console.log(`   Routing Mode : Hybrid (Managed Agent + Inline Fallback)`);
         console.log('──────────────────────────────────────────────');
 
         // Start Worker

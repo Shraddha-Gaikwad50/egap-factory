@@ -1,16 +1,25 @@
-# Production build - compile TypeScript, run JavaScript
-FROM node:20-slim
+# Production build - compile TypeScript, run JavaScript and support Python ADK execution
+FROM python:3.11-slim
 
-# Install system dependencies for Prisma and OpenSSL
-RUN apt-get update -y && apt-get install -y openssl ca-certificates && rm -rf /var/lib/apt/lists/*
+# Install system dependencies
+RUN apt-get update -y && \
+    apt-get install -y openssl ca-certificates curl gnupg && \
+    rm -rf /var/lib/apt/lists/*
 
-# Install typescript globally for compilation
-RUN npm install -g typescript
+# Install Node.js v20
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y nodejs && \
+    npm install -g typescript
+
+# Install Python requirements for ADK
+RUN pip install --no-cache-dir \
+    "google-cloud-aiplatform[agent_engines]>=1.62.0" \
+    "cloudpickle>=3.0.0"
 
 WORKDIR /app
 
-# 1. Copy Orchestrator dependencies
-COPY services/orchestrator/package*.json ./
+# 1. Copy Orchestrator dependencies and env if it exists
+COPY services/orchestrator/package*.json .env* ./
 
 # 2. Install dependencies
 RUN npm install
@@ -19,7 +28,7 @@ RUN npm install
 COPY prisma ./prisma
 COPY prisma.config.ts ./
 
-# 4. Generate Prisma Client (dummy URL - generate only needs schema, not a real DB)
+# 4. Generate Prisma Client (dummy URL - generate only needs schema)
 RUN DATABASE_URL="postgresql://dummy:dummy@localhost:5432/dummy" npx prisma generate
 
 # 5. Copy Orchestrator Source Code and prod tsconfig
@@ -28,6 +37,7 @@ COPY services/orchestrator/src ./src
 
 # 6. Compile TypeScript to JavaScript
 RUN tsc -p tsconfig.json
+RUN cp src/adk_deployer.py dist/
 
 # 7. Copy Client (Static Files) and build frontend
 COPY client ./client

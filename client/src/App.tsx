@@ -691,8 +691,9 @@ function App() {
                                 </div>
                             </div>
 
-                            <button type="submit" disabled={submitting} className="w-full py-4 bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 rounded-xl font-bold shadow-lg transition-all">
-                                {submitting ? (editingAgentId ? 'Updating...' : 'Deploying...') : (editingAgentId ? 'Update Agent' : 'Deploy Agent')}
+                            <button type="submit" disabled={submitting} className="w-full py-4 bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 rounded-xl font-bold shadow-lg transition-all flex flex-col items-center justify-center">
+                                <span>{submitting ? (editingAgentId ? 'Updating Agent...' : 'Deploying Agent...') : (editingAgentId ? 'Update Agent' : 'Deploy Agent')}</span>
+                                {submitting && <span className="text-xs text-pink-200 mt-1 font-normal animate-pulse">Building ADK Engine (takes 3-5 mins)...</span>}
                             </button>
                         </form>
 

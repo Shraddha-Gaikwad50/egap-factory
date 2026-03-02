@@ -6,6 +6,9 @@
   "scripts": {
     "dev": "node --loader ts-node/esm src/index.ts",
     "server": "node --loader ts-node/esm src/server.ts",
+    "build": "tsc -p tsconfig.prod.json",
+    "gcp-build": "npm run build",
+    "start": "node dist/index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -16,9 +19,11 @@
     "@fastify/cors": "^11.2.0",
     "@fastify/static": "^9.0.0",
     "@fastify/websocket": "^11.2.0",
+    "@google-cloud/aiplatform": "^6.4.0",
+    "@google-cloud/cloudbuild": "^5.5.0",
     "@google-cloud/pubsub": "^5.2.3",
     "@google-cloud/storage": "^7.19.0",
-    "@google/genai": "^1.42.0",
+    "@google/genai": "^1.43.0",
     "@prisma/client": "^6.19.2",
     "@types/nodemailer": "^7.0.11",
     "dotenv": "^17.2.4",

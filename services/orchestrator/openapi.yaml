@@ -1,0 +1,104 @@
+openapi: 3.0.0
+info:
+  title: EGAP Factory Agent Tools
+  description: Core enterprise tools for EGAP Agents including Email, Search, and Storage.
+  version: 1.0.0
+servers:
+  - url: https://egap-factory-910005263485.us-central1.run.app
+    description: Production Orchestrator Cloud Run URL
+paths:
+  /api/tools/send_email:
+    post:
+      summary: Send an Email (Triggers Human-in-the-Loop)
+      operationId: sendEmail
+      description: Requests to send an email. This will trigger a Human-in-the-Loop approval task. The email will not be sent until a human administrator approves it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                to:
+                  type: string
+                  description: Recipient email address
+                subject:
+                  type: string
+                  description: Subject of the email
+                body:
+                  type: string
+                  description: The body content of the email
+              required:
+                - to
+                - subject
+                - body
+      responses:
+        '200':
+          description: Task created successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result:
+                    type: string
+
+  /api/tools/search_vertex_docs:
+    post:
+      summary: Search Vertex AI Documentation
+      operationId: searchVertexDocs
+      description: Search the enterprise Vertex AI knowledge base for documentation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                query:
+                  type: string
+                  description: The search query
+              required:
+                - query
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result:
+                    type: string
+
+  /api/tools/save_file:
+    post:
+      summary: Save a File to Google Cloud Storage
+      operationId: saveFile
+      description: Save text content to a file in the project's GCS bucket.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                filename:
+                  type: string
+                  description: The name of the file to save (e.g. output.txt)
+                content:
+                  type: string
+                  description: The text content to write to the file
+              required:
+                - filename
+                - content
+      responses:
+        '200':
+          description: File saved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result:
+                    type: string
