@@ -11,10 +11,14 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     apt-get install -y nodejs && \
     npm install -g typescript
 
-# Install Python requirements for ADK
+# Install Python requirements for ADK + MCP
 RUN pip install --no-cache-dir \
     "google-cloud-aiplatform[agent_engines]>=1.62.0" \
-    "cloudpickle>=3.0.0"
+    "cloudpickle>=3.0.0" \
+    "google-adk>=0.3.0" \
+    "google-genai>=1.0.0" \
+    "mcp[cli]>=1.2.0" \
+    "requests>=2.31.0"
 
 WORKDIR /app
 
@@ -38,6 +42,9 @@ COPY services/orchestrator/src ./src
 # 6. Compile TypeScript to JavaScript
 RUN tsc -p tsconfig.json
 RUN cp src/adk_deployer.py dist/
+
+# 6b. Copy ADK Agent Python Package (used by adk_deployer.py)
+COPY services/adk-agent ./services/adk-agent
 
 # 7. Copy Client (Static Files) and build frontend
 COPY client ./client

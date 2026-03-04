@@ -16,6 +16,10 @@ import { exec } from 'child_process';
 import util from 'util';
 import fastifyWebsocket from '@fastify/websocket';
 import nodemailer from 'nodemailer';
+import { initTracing, createSpan, recordThoughtTrace, endSpanOk, endSpanWithError } from './tracing.js';
+
+// Initialize Cloud Trace (Architecture Spec: AgentOps Observability)
+initTracing();
 
 const execPromise = util.promisify(exec);
 
@@ -152,11 +156,159 @@ app.post<{ Body: { name: string, description: string, parameters: any } }>('/api
 
 /**
  * GET /.well-known/agent.json
- * List all agents
+ * A2A Protocol: Dynamic Agent Card Manifest
+ * Returns an A2A-compliant manifest of all deployed agents with their capabilities.
  */
 app.get('/.well-known/agent.json', async (_request, _reply) => {
-    const agents = await prisma.agent.findMany();
-    return { agents: agents };
+    const agents = await prisma.agent.findMany({
+        include: { tools: true, deployments: true },
+    });
+
+    const agentCards = agents.map((agent: any) => {
+        const activeDeployment = agent.deployments?.find((d: any) => d.status === 'ACTIVE');
+        return {
+            // A2A Agent Card fields
+            name: agent.name,
+            description: `${agent.role} — ${agent.goal}`,
+            url: activeDeployment?.serviceUrl || null,
+            version: `v${agent.currentVersion}`,
+            protocols: ['a2a/1.0', 'mcp/1.0'],
+            capabilities: {
+                tools: agent.tools.map((t: any) => ({
+                    name: t.name,
+                    description: t.description,
+                    actionType: t.actionType || 'READ',
+                    mcpServerUrl: t.mcpServerUrl || null,
+                })),
+                hitl: agent.tools.some((t: any) => t.actionType === 'WRITE'),
+            },
+            status: agent.isActive ? 'ACTIVE' : 'INACTIVE',
+            adkResourceName: agent.adkResourceName || null,
+            endpoints: {
+                chat: `/api/chat`,
+                resume: `/api/agents/${agent.id}/resume`,
+                card: `/api/agents/${agent.id}/card`,
+            },
+        };
+    });
+
+    return {
+        protocol: 'a2a/1.0',
+        platform: 'GiantLeap Agentic Platform v2',
+        agents: agentCards,
+    };
+});
+
+/**
+ * GET /api/agents/:id/card
+ * A2A Protocol: Individual Agent Card
+ */
+app.get<{ Params: { id: string } }>('/api/agents/:id/card', async (request, reply) => {
+    const agent = await prisma.agent.findUnique({
+        where: { id: request.params.id },
+        include: { tools: true, deployments: true },
+    });
+    if (!agent) return reply.status(404).send({ error: 'Agent not found' });
+
+    const activeDeployment = agent.deployments?.find((d: any) => d.status === 'ACTIVE');
+    return {
+        protocol: 'a2a/1.0',
+        name: agent.name,
+        description: `${agent.role} — ${agent.goal}`,
+        url: activeDeployment?.serviceUrl || null,
+        version: `v${agent.currentVersion}`,
+        capabilities: {
+            tools: agent.tools.map((t: any) => ({
+                name: t.name,
+                actionType: t.actionType || 'READ',
+            })),
+            hitl: agent.tools.some((t: any) => t.actionType === 'WRITE'),
+        },
+        status: agent.isActive ? 'ACTIVE' : 'INACTIVE',
+    };
+});
+
+/**
+ * POST /api/agents/:id/resume
+ * A2A Protocol: Resume a suspended agent after HITL approval.
+ * Spec: "ACC sends POST /resume. Agent wakes up, loads previous state,
+ *        injects human input, and continues."
+ */
+app.post<{ Params: { id: string }; Body: { taskId: string; feedback?: string } }>('/api/agents/:id/resume', async (request, reply) => {
+    const { id } = request.params;
+    const { taskId, feedback } = request.body;
+
+    try {
+        // 1. Approve the task
+        const task = await prisma.task.update({
+            where: { id: taskId },
+            data: { status: 'APPROVED' },
+            include: { agent: true },
+        });
+
+        // 2. Execute the approved action (same inline execution as before)
+        const taskPayload = task.inputPayload as any;
+        let toolOutput = '';
+
+        if (taskPayload) {
+            const emailRecipient = taskPayload.to_email || taskPayload.recipient || taskPayload.to;
+            const emailBody = taskPayload.body || taskPayload.message;
+
+            if (emailRecipient && taskPayload.subject && emailBody) {
+                console.log(`📧 A2A Resume: Sending email to ${emailRecipient}...`);
+                try {
+                    const transporter = nodemailer.createTransport({
+                        service: 'gmail',
+                        auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD },
+                    });
+                    await transporter.sendMail({
+                        from: `"EGAP Agent" <${GMAIL_USER}>`,
+                        to: emailRecipient,
+                        subject: taskPayload.subject,
+                        text: emailBody,
+                        html: `<div style="font-family: sans-serif; padding: 20px;">
+                            <h2 style="color: #7c3aed;">📩 EGAP Agent Email</h2>
+                            <hr style="border-color: #e5e7eb;" />
+                            <p>${emailBody.replace(/\n/g, '<br>')}</p>
+                            <hr style="border-color: #e5e7eb;" />
+                            <p style="color: #9ca3af; font-size: 12px;">Sent via A2A Resume protocol.</p>
+                        </div>`,
+                    });
+                    toolOutput = `[System] ✅ Email sent to ${emailRecipient} (via A2A Resume)`;
+                } catch (emailErr: any) {
+                    toolOutput = `[System] ❌ Email failed: ${emailErr.message}`;
+                }
+            } else {
+                toolOutput = `[System] ✅ Approved action executed: ${JSON.stringify(taskPayload)}`;
+            }
+        } else {
+            toolOutput = `[System] ✅ Task approved (no payload).`;
+        }
+
+        // 3. Mark task as completed
+        await prisma.task.update({ where: { id: taskId }, data: { status: 'COMPLETED' } });
+
+        // 4. Log the feedback/result in chat
+        await prisma.message.create({
+            data: {
+                agentId: id,
+                role: 'assistant',
+                content: feedback ? `[A2A Resume] Human feedback: ${feedback}\n${toolOutput}` : toolOutput,
+            },
+        });
+
+        console.log(`✅ A2A Resume completed for Agent ${id}, Task ${taskId}`);
+
+        return reply.send({
+            protocol: 'a2a/1.0',
+            status: 'COMPLETED',
+            taskId,
+            executionResult: toolOutput,
+        });
+    } catch (err: any) {
+        console.error('❌ A2A Resume failed:', err);
+        return reply.status(500).send({ error: 'A2A Resume failed' });
+    }
 });
 
 /**
@@ -206,7 +358,9 @@ app.post<{ Body: AgentPayload }>('/api/agents', async (request, reply) => {
                 id: agent.id,
                 name: name,
                 role: role,
-                systemPrompt: systemPrompt
+                goal: goal,
+                systemPrompt: systemPrompt,
+                tools: tools, // Pass tool names to ADK deployer
             });
 
             console.log(`⏳ Submitting ADK deployment script. This will take 3-5 minutes...`);
@@ -242,6 +396,12 @@ app.post<{ Body: AgentPayload }>('/api/agents', async (request, reply) => {
                     status: 'ACTIVE',
                     serviceUrl: resourceName
                 }
+            });
+
+            // Store ADK resource name on Agent model (Architecture Spec)
+            await prisma.agent.update({
+                where: { id: agent.id },
+                data: { adkResourceName: resourceName }
             });
 
         } catch (cxErr: any) {
@@ -1132,6 +1292,15 @@ async function processChat(data: { type: string; agentId: string; message: strin
 
         console.log(`🤖 Sending streaming message to Vertex AI...`);
 
+        // Cloud Trace: Record reasoning trace
+        const reasoningSpan = recordThoughtTrace(
+            data.traceId || 'no-trace',
+            'ACT',
+            `Agent ${agent.name} processing: ${data.message.substring(0, 100)}`,
+            agentId
+        );
+        reasoningSpan.end();
+
         // @ts-ignore
         const streamResult = await chat.sendMessageStream({ message: data.message });
 
@@ -1447,6 +1616,79 @@ async function handleMessage(message: Message): Promise<void> {
         }
     }
 }
+
+// ── ADK Callback Endpoints ──────────────────────────────────────────
+// These endpoints are called by the ADK agent's before_tool_callback
+// and after_tool_callback to create HITL tasks and log tool usage.
+
+/**
+ * POST /api/tasks/hitl
+ * Called by ADK agent's before_tool_callback when a WRITE tool is intercepted.
+ * Creates a PENDING_APPROVAL task for the HITL governance flow.
+ */
+app.post<{ Body: { description: string; agentId: string; inputPayload: any; traceId?: string } }>('/api/tasks/hitl', async (request, reply) => {
+    const { description, agentId, inputPayload, traceId } = request.body;
+
+    try {
+        const task = await prisma.task.create({
+            data: {
+                description,
+                status: 'PENDING',
+                agentId,
+                inputPayload,
+                traceId: traceId || null,
+            },
+            include: { agent: true },
+        });
+
+        console.log(`🔒 HITL Task ${task.id} created by ADK callback (Agent: ${task.agent?.name})`);
+
+        // Notify connected WebSocket clients
+        for (const [, socket] of activeConnections) {
+            try {
+                socket.send(JSON.stringify({
+                    type: 'hitl_task_created',
+                    task: {
+                        id: task.id,
+                        description: task.description,
+                        status: 'PENDING',
+                        agentId,
+                        agentName: task.agent?.name || 'Unknown',
+                    },
+                }));
+            } catch (e) { /* ignore dead sockets */ }
+        }
+
+        return reply.status(201).send(task);
+    } catch (err: any) {
+        console.error('❌ Failed to create HITL task:', err);
+        return reply.status(500).send({ error: 'Failed to create HITL task' });
+    }
+});
+
+/**
+ * POST /api/usage-log
+ * Called by ADK agent's after_tool_callback to log tool execution for cost accounting.
+ */
+app.post<{ Body: { agentId: string; action: string; tokens?: number; costUsd?: number; metadata?: any } }>('/api/usage-log', async (request, reply) => {
+    const { agentId, action, tokens, costUsd, metadata } = request.body;
+
+    try {
+        const log = await prisma.usageLog.create({
+            data: {
+                agentId,
+                action,
+                tokens: tokens || 0,
+                costUsd: costUsd || 0,
+                metadata: metadata || {},
+            },
+        });
+        return reply.status(201).send(log);
+    } catch (err: any) {
+        console.error('❌ Failed to log usage:', err);
+        return reply.status(500).send({ error: 'Failed to log usage' });
+    }
+});
 
 // ── Start Service ────────────────────────────────────────────────────
 const start = async () => {
