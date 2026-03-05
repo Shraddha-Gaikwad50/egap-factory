@@ -167,8 +167,16 @@ app.get('/.well-known/agent.json', async (_request, _reply) => {
     const agentCards = agents.map((agent: any) => {
         const activeDeployment = agent.deployments?.find((d: any) => d.status === 'ACTIVE');
         return {
+            // Core fields (needed by frontend)
+            id: agent.id,
             // A2A Agent Card fields
             name: agent.name,
+            role: agent.role,
+            goal: agent.goal,
+            systemPrompt: agent.systemPrompt,
+            isActive: agent.isActive,
+            currentVersion: agent.currentVersion,
+            budgetUsd: agent.budgetUsd,
             description: `${agent.role} — ${agent.goal}`,
             url: activeDeployment?.serviceUrl || null,
             version: `v${agent.currentVersion}`,
@@ -182,6 +190,8 @@ app.get('/.well-known/agent.json', async (_request, _reply) => {
                 })),
                 hitl: agent.tools.some((t: any) => t.actionType === 'WRITE'),
             },
+            // Flatten tools for frontend compatibility
+            tools: agent.tools.map((t: any) => t.name),
             status: agent.isActive ? 'ACTIVE' : 'INACTIVE',
             adkResourceName: agent.adkResourceName || null,
             endpoints: {

@@ -16,7 +16,18 @@ from google.cloud import storage
 from vertexai.preview import reasoning_engines
 
 # Add adk-agent to path so we can import it
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'adk-agent'))
+# In Docker: /app/dist/adk_deployer.py -> adk-agent at /app/services/adk-agent
+# Locally: /services/orchestrator/src/adk_deployer.py -> adk-agent at /services/adk-agent
+_base = os.path.dirname(os.path.abspath(__file__))
+_candidates = [
+    os.path.join(_base, '..', 'services', 'adk-agent'),  # Docker: /app/dist/../services/adk-agent
+    os.path.join(_base, '..', 'adk-agent'),               # Local fallback: src/../adk-agent
+    os.path.join(_base, '..', '..', 'adk-agent'),         # Alternative local
+]
+for _p in _candidates:
+    if os.path.isdir(_p):
+        sys.path.insert(0, _p)
+        break
 
 from agent import create_egap_agent
 
