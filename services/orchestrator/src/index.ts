@@ -434,6 +434,113 @@ app.post<{ Body: AgentPayload }>('/api/agents', async (request, reply) => {
 });
 
 /**
+ * POST /api/agents/:id/redeploy
+ * Re-trigger ADK deployment for an existing agent to Vertex AI Agent Engine.
+ * Useful when a previous deployment failed or adkResourceName is null.
+ *
+ * NOTE: This is intentionally SYNCHRONOUS — the HTTP connection stays open
+ * during the 3-5 minute Vertex AI deployment, keeping the Cloud Run container alive.
+ * The caller should expect a 200 response after ~3-5 minutes.
+ */
+app.post<{ Params: { id: string } }>('/api/agents/:id/redeploy', async (request, reply) => {
+    const { id } = request.params;
+
+    try {
+        const agent = await prisma.agent.findUnique({
+            where: { id },
+            include: { tools: true },
+        });
+
+        if (!agent) {
+            return reply.status(404).send({ error: 'Agent not found' });
+        }
+
+        const toolNames = agent.tools.map((t: any) => t.name);
+
+        console.log(`🔄 Re-deploying ADK Agent to Vertex AI: ${agent.name} (id=${id})`);
+        console.log(`⏳ Deploying... will take 3-5 minutes. HTTP connection held open.`);
+
+        // SYNCHRONOUS — await the full deployment so Cloud Run container stays alive
+        const scriptPath = path.join(__dirname, 'adk_deployer.py');
+        const payload = JSON.stringify({
+            id: agent.id,
+            name: agent.name,
+            role: agent.role,
+            goal: agent.goal,
+            systemPrompt: agent.systemPrompt,
+            tools: toolNames,
+        });
+
+        let resourceName = '';
+        try {
+            const { stdout, stderr } = await execPromise(
+                `python3 ${scriptPath} '${payload.replace(/'/g, "'\\''")}'`,
+                { timeout: 600_000 } // 10 minutes max
+            );
+
+            if (stderr) console.log('ADK Redeploy stderr:', stderr.slice(0, 500));
+
+            const stdoutLines = stdout.trim().split('\n');
+            resourceName = stdoutLines.pop()?.trim() || '';
+
+            if (!resourceName.startsWith('projects/')) {
+                const match = stdout.match(/projects\/\d+\/locations\/[\w-]+\/reasoningEngines\/\d+/);
+                resourceName = match ? match[0] : '';
+            }
+        } catch (deployErr: any) {
+            console.error('❌ ADK Deploy script error:', deployErr.message || deployErr);
+            await prisma.deployment.create({
+                data: { agentId: agent.id, status: 'FAILED', serviceUrl: null },
+            }).catch(console.error);
+            return reply.status(500).send({
+                error: 'Vertex AI deployment failed',
+                details: deployErr.message,
+            });
+        }
+
+        if (resourceName) {
+            // Update existing deployment or create new one
+            const existing = await prisma.deployment.findFirst({ where: { agentId: agent.id } });
+            if (existing) {
+                await prisma.deployment.update({
+                    where: { id: existing.id },
+                    data: { status: 'ACTIVE', serviceUrl: resourceName },
+                }).catch(console.error);
+            } else {
+                await prisma.deployment.create({
+                    data: { agentId: agent.id, status: 'ACTIVE', serviceUrl: resourceName },
+                }).catch(console.error);
+            }
+
+            await prisma.agent.update({
+                where: { id: agent.id },
+                data: { adkResourceName: resourceName } as any,
+            });
+
+            console.log(`☁️ Re-deployed ${agent.name}: ${resourceName}`);
+            return reply.status(200).send({
+                status: 'deployed',
+                agentName: agent.name,
+                adkResourceName: resourceName,
+            });
+        } else {
+            await prisma.deployment.create({
+                data: { agentId: agent.id, status: 'FAILED', serviceUrl: null },
+            }).catch(console.error);
+            return reply.status(500).send({ error: 'Deployment failed — no resource name returned from script' });
+        }
+
+    } catch (err: any) {
+        app.log.error(err);
+        return reply.status(500).send({ error: 'Failed to initiate redeploy' });
+    }
+});
+
+
+
+
+
+/**
  * PUT /api/agents/:id
  * Update an existing agent blueprint
  */
@@ -642,8 +749,14 @@ app.post<{ Body: ChatPayload }>('/api/chat', async (request, reply) => {
         });
         const hasTools = agentRecord && agentRecord.tools && agentRecord.tools.length > 0;
 
-        if (!hasTools && deployment && deployment.serviceUrl && deployment.serviceUrl.startsWith('projects/')) {
-            const agentPath = deployment.serviceUrl;
+        // Prefer adkResourceName (canonical, set on successful deploy) over
+        // deployment.serviceUrl (can be null from stale FAILED records).
+        const adkResource =
+            (agentRecord as any)?.adkResourceName ||
+            (deployment?.serviceUrl?.startsWith('projects/') ? deployment.serviceUrl : null);
+
+        if (!hasTools && adkResource) {
+            const agentPath = adkResource;
 
             console.log(`🌐 Routing chat to ADK Reasoning Engine: ${agentPath}`);
 

@@ -4,36 +4,329 @@ Deploys real ADK agents to Vertex AI Agent Engine (Reasoning Engine).
 
 Called by the orchestrator's POST /api/agents endpoint.
 Receives agent config as JSON argument and deploys to Vertex AI.
+
+All agent logic from egap_agent/core.py is inlined here so that
+cloudpickle only references standard pip-installable packages
+(google-adk, google-genai, requests). No custom package installation
+is needed in the Vertex AI build container.
 """
 
 import sys
 import os
 import json
 import logging
+from typing import Optional
 
 import vertexai
 from google.cloud import storage
-from vertexai.preview import reasoning_engines
-
-# Add adk-agent to path so we can import it
-# In Docker: /app/dist/adk_deployer.py -> adk-agent at /app/services/adk-agent
-# Locally: /services/orchestrator/src/adk_deployer.py -> adk-agent at /services/adk-agent
-_base = os.path.dirname(os.path.abspath(__file__))
-_candidates = [
-    os.path.join(_base, '..', 'services', 'adk-agent'),  # Docker: /app/dist/../services/adk-agent
-    os.path.join(_base, '..', 'adk-agent'),               # Local fallback: src/../adk-agent
-    os.path.join(_base, '..', '..', 'adk-agent'),         # Alternative local
-]
-for _p in _candidates:
-    if os.path.isdir(_p):
-        sys.path.insert(0, _p)
-        break
-
-from agent import create_egap_agent
 
 logger = logging.getLogger("adk-deployer")
 logging.basicConfig(level=logging.INFO)
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# INLINED FROM egap_agent/core.py — Agent logic, tools, HITL callbacks
+# ═════════════════════════════════════════════════════════════════════════════
+
+import requests as req_lib
+from google.adk.agents import Agent
+from google.adk.tools import FunctionTool
+from google.genai import types
+
+# Configuration
+_PROJECT_ID = os.getenv("PROJECT_ID", "gls-training-486405")
+_LOCATION = os.getenv("LOCATION", "us-central1")
+_MODEL_NAME = os.getenv("MODEL_NAME", "gemini-2.5-flash")
+_FACTORY_URL = os.getenv("FACTORY_URL", "http://localhost:3000")
+_MCP_HUB_URL = os.getenv("MCP_HUB_URL", "http://localhost:8080")
+
+_agent_logger = logging.getLogger("egap-adk-agent")
+
+
+# ─── HITL Callbacks ───────────────────────────────────────────────────────────
+
+def _hitl_before_tool_callback(tool, args, tool_context):
+    """HITL Suspend & Resume: intercepts WRITE tools before execution."""
+    tool_name = tool.name if hasattr(tool, 'name') else str(tool)
+    write_tools = {"send_email", "save_file"}
+
+    if tool_name in write_tools:
+        _agent_logger.info(f"🔒 HITL INTERCEPT: Tool '{tool_name}' is a WRITE tool. Suspending.")
+        agent_id = getattr(tool_context, 'agent_id', None) or os.getenv("AGENT_ID", "unknown")
+        trace_id = getattr(tool_context, 'trace_id', None) or "no-trace"
+
+        try:
+            task_payload = {
+                "description": f"Agent requested WRITE operation: {tool_name}",
+                "agentId": agent_id,
+                "inputPayload": args,
+                "traceId": trace_id,
+            }
+            resp = req_lib.post(f"{_FACTORY_URL}/api/tasks/hitl", json=task_payload, timeout=10)
+            task_id = resp.json().get("id", "unknown") if resp.ok else "error"
+            if resp.ok:
+                _agent_logger.info(f"⏳ HITL Task {task_id} created. Execution suspended.")
+            else:
+                _agent_logger.error(f"❌ Failed to create HITL task: {resp.text}")
+        except Exception as e:
+            task_id = "error"
+            _agent_logger.error(f"❌ Failed to create HITL task: {e}")
+
+        return {
+            "status": "PENDING_APPROVAL",
+            "message": (
+                f"Tool '{tool_name}' requires Human-in-the-Loop approval. "
+                f"A task (ID: {task_id}) has been created for admin review. "
+                f"Execution is suspended until approval."
+            ),
+        }
+
+    _agent_logger.info(f"✅ Tool '{tool_name}' is a READ tool. Allowing execution.")
+    return None
+
+
+def _hitl_after_tool_callback(tool, args, tool_context, tool_response):
+    """AgentOps Cost Accounting: logs tool execution for cost tracking."""
+    tool_name = tool.name if hasattr(tool, 'name') else str(tool)
+    _agent_logger.info(f"📊 Tool executed: {tool_name}")
+
+    try:
+        agent_id = getattr(tool_context, 'agent_id', None) or os.getenv("AGENT_ID", "unknown")
+        req_lib.post(
+            f"{_FACTORY_URL}/api/usage-log",
+            json={
+                "agentId": agent_id,
+                "action": f"tool_execute_{tool_name}",
+                "tokens": 0,
+                "costUsd": 0,
+                "metadata": {"tool": tool_name, "args_keys": list(args.keys())},
+            },
+            timeout=5,
+        )
+    except Exception as e:
+        _agent_logger.warning(f"Failed to log tool usage: {e}")
+
+    return None
+
+
+# ─── MCP Tool Wrappers ───────────────────────────────────────────────────────
+
+def search_vertex_docs(query: str) -> str:
+    """Search the official Vertex AI documentation for technical answers.
+    This is a READ tool — executes immediately.
+
+    Args:
+        query: The search query string.
+
+    Returns:
+        Relevant documentation snippets.
+    """
+    try:
+        resp = req_lib.post(
+            f"{_MCP_HUB_URL}/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": "search_vertex_docs", "arguments": {"query": query}},
+                "id": 1,
+            },
+            timeout=30,
+        )
+        if resp.ok:
+            result = resp.json()
+            if "result" in result:
+                content = result["result"].get("content", [])
+                return content[0].get("text", "No results") if content else "No results"
+        return "Error calling MCP search tool"
+    except Exception as e:
+        return f"MCP tool error: {e}"
+
+
+def send_email(to_email: str, subject: str, body: str) -> str:
+    """Send an email to a recipient. Requires subject and body.
+    ⚠️ WRITE tool — requires HITL approval before execution.
+
+    Args:
+        to_email: Recipient email address.
+        subject: Email subject line.
+        body: Email body content.
+
+    Returns:
+        Confirmation or status message.
+    """
+    try:
+        resp = req_lib.post(
+            f"{_MCP_HUB_URL}/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {
+                    "name": "send_email",
+                    "arguments": {"to_email": to_email, "subject": subject, "body": body},
+                },
+                "id": 1,
+            },
+            timeout=30,
+        )
+        if resp.ok:
+            result = resp.json()
+            content = result.get("result", {}).get("content", [])
+            return content[0].get("text", "Email sent") if content else "Email sent"
+        return "Error calling MCP email tool"
+    except Exception as e:
+        return f"MCP tool error: {e}"
+
+
+def save_file(filename: str, content: str) -> str:
+    """Save text content to a file in Google Cloud Storage.
+    ⚠️ WRITE tool — requires HITL approval before execution.
+
+    Args:
+        filename: Name of the file to create.
+        content: Text content to save.
+
+    Returns:
+        GCS URI of the saved file.
+    """
+    try:
+        resp = req_lib.post(
+            f"{_MCP_HUB_URL}/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {
+                    "name": "save_file",
+                    "arguments": {"filename": filename, "content": content},
+                },
+                "id": 1,
+            },
+            timeout=30,
+        )
+        if resp.ok:
+            result = resp.json()
+            content_items = result.get("result", {}).get("content", [])
+            return content_items[0].get("text", "File saved") if content_items else "File saved"
+        return "Error calling MCP save_file tool"
+    except Exception as e:
+        return f"MCP tool error: {e}"
+
+
+# ─── Agent Factory ────────────────────────────────────────────────────────────
+
+_TOOL_REGISTRY = {
+    "search_vertex_docs": search_vertex_docs,
+    "send_email": send_email,
+    "save_file": save_file,
+}
+
+
+def _create_egap_agent(
+    agent_id: str,
+    name: str,
+    system_prompt: str,
+    tool_names: list,
+    model_name: str = None,
+) -> Agent:
+    """Create an ADK Agent from EGAP configuration (inlined)."""
+    if model_name is None:
+        model_name = _MODEL_NAME
+
+    agent_tools = []
+    for tool_name in tool_names:
+        if tool_name in _TOOL_REGISTRY:
+            agent_tools.append(_TOOL_REGISTRY[tool_name])
+            _agent_logger.info(f"  📎 Attached tool: {tool_name}")
+        else:
+            _agent_logger.warning(f"  ⚠️ Unknown tool: {tool_name} — skipping")
+
+    os.environ["AGENT_ID"] = agent_id
+
+    agent = Agent(
+        name=name.lower().replace(" ", "_"),
+        model=model_name,
+        instruction=system_prompt,
+        tools=agent_tools,
+        before_tool_callback=_hitl_before_tool_callback,
+        after_tool_callback=_hitl_after_tool_callback,
+    )
+
+    _agent_logger.info(f"✅ Created ADK Agent: {name} (id={agent_id}, tools={tool_names})")
+    return agent
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Deployer main — Deploys to Vertex AI Agent Engine
+# ═════════════════════════════════════════════════════════════════════════════
+
+from google.adk.runners import InMemoryRunner
+from google.genai.types import Content, Part
+
+class EGAPReasoningApp:
+    """Minimal ReasoningEngine-compatible wrapper around an ADK Agent.
+    MUST be defined at the module level so Vertex AI AST extraction can find it.
+    """
+    def __init__(self, agent_config: dict):
+        """
+        ReasoningEngine App wrapper.
+        We store the config and create the Agent LACILY to ensure 
+        Vertex AI environment variables are set before the Agent's 
+        internal model client is initialized.
+        """
+        self._config = agent_config
+        self._agent = None
+
+    def _ensure_vertex_auth(self):
+        """Ensure the google-genai SDK used by ADK uses Vertex AI auth."""
+        os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "1"
+        os.environ["GOOGLE_CLOUD_PROJECT"] = self._config.get("project_id") or os.getenv("PROJECT_ID", "gls-training-486405")
+        os.environ["GOOGLE_CLOUD_LOCATION"] = self._config.get("location") or os.getenv("LOCATION", "us-central1")
+        
+        # Also init the platform SDK just in case
+        import vertexai
+        vertexai.init(
+            project=os.environ["GOOGLE_CLOUD_PROJECT"],
+            location=os.environ["GOOGLE_CLOUD_LOCATION"],
+        )
+
+    def set_up(self):
+        """Called automatically by Vertex AI when the container starts."""
+        self._ensure_vertex_auth()
+
+    def _get_agent(self) -> Agent:
+        if self._agent is None:
+            self._ensure_vertex_auth()
+            self._agent = _create_egap_agent(
+                agent_id=self._config["agent_id"],
+                name=self._config["name"],
+                system_prompt=self._config["system_prompt"],
+                tool_names=self._config["tool_names"],
+            )
+        return self._agent
+
+    async def query(self, input_text: str, user_id: str = "user") -> str:
+        self._ensure_vertex_auth()
+        agent = self._get_agent()
+        
+        runner = InMemoryRunner(
+            agent=agent,
+            app_name=agent.name,
+        )
+        session = await runner.session_service.create_session(
+            app_name=agent.name,
+            user_id=user_id,
+        )
+        content = Content(role="user", parts=[Part(text=input_text)])
+        final_response = ""
+        async for event in runner.run_async(
+            user_id=user_id,
+            session_id=session.id,
+            new_message=content,
+        ):
+            if hasattr(event, "content") and event.content:
+                for part in event.content.parts:
+                    if hasattr(part, "text") and part.text:
+                        final_response += part.text
+        return final_response or "No response generated."
 
 def main():
     if len(sys.argv) < 2:
@@ -46,8 +339,8 @@ def main():
         print(f"Error parsing JSON: {e}", file=sys.stderr)
         sys.exit(1)
 
-    project_id = os.getenv("PROJECT_ID", "gls-training-486405")
-    location = os.getenv("LOCATION", "us-central1")
+    project_id  = os.getenv("PROJECT_ID", "gls-training-486405")
+    location    = os.getenv("LOCATION", "us-central1")
     bucket_name = f"{project_id}-adk-staging"
 
     # 1. Ensure staging bucket exists
@@ -63,32 +356,41 @@ def main():
         staging_bucket=f"gs://{bucket_name}",
     )
 
-    # 2. Extract agent properties from the JSON payload
-    agent_id = agent_data.get("id", "unknown-id")
-    name = agent_data.get("name", "Unnamed Agent")
-    role = agent_data.get("role", "")
-    goal = agent_data.get("goal", "")
+    # 2. Extract agent properties
+    agent_id   = agent_data.get("id", "unknown-id")
+    name       = agent_data.get("name", "Unnamed Agent")
+    role       = agent_data.get("role", "")
+    goal       = agent_data.get("goal", "")
     sys_prompt = agent_data.get("systemPrompt", "")
     tool_names = agent_data.get("tools", [])
 
     logger.info(f"🚀 Deploying ADK Agent: {name} (id={agent_id})")
     logger.info(f"   Tools: {tool_names}")
 
-    # 3. Create the ADK Agent using the factory function
-    adk_agent = create_egap_agent(
-        agent_id=agent_id,
-        name=name,
-        system_prompt=sys_prompt,
-        tool_names=tool_names,
-    )
+    # 3. Create the Agent config for lazy initialization
+    agent_config = {
+        "agent_id": agent_id,
+        "name": name,
+        "system_prompt": sys_prompt,
+        "tool_names": tool_names,
+        "project_id": project_id,
+        "location": location,
+    }
 
+    # 4. Wrap in EGAPReasoningApp (required by ReasoningEngine / Agent Engine)
+    app = EGAPReasoningApp(agent_config)
+
+    # 5. Deploy to Vertex AI Agent Engine (ReasoningEngine)
+    #    No extra_packages needed — all code is inlined, and cloudpickle
+    #    only references standard pip-installable packages.
     try:
-        # 4. Deploy to Vertex AI Reasoning Engine
+        from vertexai.preview import reasoning_engines
+
         remote_app = reasoning_engines.ReasoningEngine.create(
-            adk_agent,
+            app,
             requirements=[
                 "google-adk>=0.3.0",
-                "google-cloud-aiplatform>=1.60.0",
+                "google-cloud-aiplatform>=1.62.0",
                 "google-cloud-storage>=2.14.0",
                 "google-genai>=1.0.0",
                 "requests>=2.31.0",
@@ -97,7 +399,7 @@ def main():
             description=f"EGAP Agent: {role} — {goal}",
         )
 
-        # 5. Print the resource name to stdout so the TS orchestrator can read it
+        # 6. Print resource name to stdout (orchestrator reads it)
         print(remote_app.resource_name)
         logger.info(f"☁️ ADK Agent deployed: {remote_app.resource_name}")
         sys.exit(0)

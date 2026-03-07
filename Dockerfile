@@ -15,6 +15,8 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
 RUN pip install --no-cache-dir \
     "google-cloud-aiplatform[agent_engines]>=1.62.0" \
     "cloudpickle>=3.0.0" \
+    "setuptools>=65.0.0" \
+    "wheel>=0.40.0" \
     "google-adk>=0.3.0" \
     "google-genai>=1.0.0" \
     "mcp[cli]>=1.2.0" \
