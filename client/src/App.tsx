@@ -1,5 +1,5 @@
 
-import { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { AreaChart, Area, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
 
 // ── Types ────────────────────────────────────────────────────────────
@@ -109,6 +109,24 @@ function App() {
     const [editingPayload, setEditingPayload] = useState<string>('');
     const [savingTask, setSavingTask] = useState(false);
 
+    // State: Governance — Audit Log & Task Filtering
+    const [auditLogs, setAuditLogs] = useState<any[]>([]);
+    const [allTasks, setAllTasks] = useState<any[]>([]);
+    const [taskStatusFilter, setTaskStatusFilter] = useState('ALL');
+    const [taskAgentFilter, setTaskAgentFilter] = useState('');
+    const [taskSearchQuery, setTaskSearchQuery] = useState('');
+    const [commentText, setCommentText] = useState('');
+    const [commentingTaskId, setCommentingTaskId] = useState<string | null>(null);
+
+    // State: Observability — Enhanced
+    const [expandedTraceId, setExpandedTraceId] = useState<string | null>(null);
+    const [traceSpans, setTraceSpans] = useState<any[]>([]);
+    const [errorLogs, setErrorLogs] = useState<any[]>([]);
+    const [activityAgentId, setActivityAgentId] = useState<string>('');
+    const [activityTimeline, setActivityTimeline] = useState<any[]>([]);
+    const [expandedMessageId, setExpandedMessageId] = useState<string | null>(null);
+    const [messageDetail, setMessageDetail] = useState<any>(null);
+
     // ── Effects ──────────────────────────────────────────────────────
     useEffect(() => {
         fetchTools();
@@ -118,14 +136,14 @@ function App() {
 
     useEffect(() => {
         // Immediately fetch data when switching to a tab (no 3s delay)
-        if (activeTab === 'govern') fetchTasks();
-        if (activeTab === 'observe') { fetchStats(); fetchReconciliation(); }
+        if (activeTab === 'govern') { fetchTasks(); fetchAllTasks(); fetchAuditLogs(); }
+        if (activeTab === 'observe') { fetchStats(); fetchReconciliation(); fetchErrorLogs(); }
         if (activeTab === 'analytics') fetchCostTimeseries();
 
         const interval = setInterval(() => {
             if (activeTab === 'test' && selectedAgentId) fetchMessages();
-            if (activeTab === 'observe') { fetchStats(); fetchReconciliation(); }
-            if (activeTab === 'govern') fetchTasks();
+            if (activeTab === 'observe') { fetchStats(); fetchReconciliation(); fetchErrorLogs(); }
+            if (activeTab === 'govern') { fetchTasks(); fetchAllTasks(); fetchAuditLogs(); }
             if (activeTab === 'analytics') fetchCostTimeseries();
             fetchEmergencyStatus(); // Always poll safety status
         }, 3000);
@@ -247,6 +265,83 @@ function App() {
             const res = await fetch(`/api/agents/${selectedAgentId}/messages`);
             if (res.ok) setChatHistory(await res.json());
         } catch (e) { console.error(e); }
+    };
+
+    // ── Governance API Calls ──────────────────────────────────────
+    const fetchAuditLogs = async () => {
+        try {
+            const res = await fetch('/api/audit-logs?limit=50');
+            if (res.ok) setAuditLogs(await res.json());
+        } catch (e) { console.error(e); }
+    };
+
+    const fetchAllTasks = async () => {
+        try {
+            const params = new URLSearchParams();
+            if (taskStatusFilter !== 'ALL') params.set('status', taskStatusFilter);
+            if (taskAgentFilter) params.set('agentId', taskAgentFilter);
+            if (taskSearchQuery) params.set('search', taskSearchQuery);
+            const res = await fetch(`/api/tasks/all?${params.toString()}`);
+            if (res.ok) setAllTasks(await res.json());
+        } catch (e) { console.error(e); }
+    };
+
+    const handleAddComment = async (taskId: string) => {
+        if (!commentText.trim()) return;
+        try {
+            const res = await fetch(`/api/tasks/${taskId}/comment`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: commentText }),
+            });
+            if (res.ok) {
+                setCommentText('');
+                setSuccessMessage('Comment added!');
+                fetchAllTasks();
+                fetchAuditLogs();
+            }
+        } catch (e) { setErrorMessage('Failed to add comment'); }
+    };
+
+    // ── Observability API Calls ───────────────────────────────────
+    const fetchTraceSpans = async (traceId: string) => {
+        try {
+            const res = await fetch(`/api/traces/${traceId}/spans`);
+            if (res.ok) setTraceSpans(await res.json());
+        } catch (e) { console.error(e); }
+    };
+
+    const fetchErrorLogs = async () => {
+        try {
+            const res = await fetch('/api/error-logs?limit=30');
+            if (res.ok) setErrorLogs(await res.json());
+        } catch (e) { console.error(e); }
+    };
+
+    const fetchAgentActivity = async (agentId: string) => {
+        try {
+            const res = await fetch(`/api/agents/${agentId}/activity?limit=50`);
+            if (res.ok) setActivityTimeline(await res.json());
+        } catch (e) { console.error(e); }
+    };
+
+    const fetchMessageDetail = async (messageId: string) => {
+        try {
+            const res = await fetch(`/api/messages/${messageId}/detail`);
+            if (res.ok) setMessageDetail(await res.json());
+        } catch (e) { console.error(e); }
+    };
+
+    // ── SLA Timer Helper ──────────────────────────────────────────
+    const getSlaInfo = (createdAt: string) => {
+        const elapsed = Date.now() - new Date(createdAt).getTime();
+        const minutes = Math.floor(elapsed / 60000);
+        const hours = Math.floor(minutes / 60);
+        const display = hours > 0 ? `${hours}h ${minutes % 60}m` : `${minutes}m`;
+        let color = 'text-green-400 border-green-500/30 bg-green-900/20';
+        if (minutes >= 30) color = 'text-red-400 border-red-500/30 bg-red-900/20';
+        else if (minutes >= 5) color = 'text-yellow-400 border-yellow-500/30 bg-yellow-900/20';
+        return { display, color, minutes };
     };
 
     // ── Handlers ─────────────────────────────────────────────────────
@@ -798,65 +893,167 @@ function App() {
 
                 {/* ── TAB: GOVERNANCE ─────────────────────────────────── */}
                 {activeTab === 'govern' && (
-                    <div className="max-w-5xl mx-auto">
-                        <h2 className="text-2xl font-bold mb-6">Pending Approvals (HITL)</h2>
-                        <div className="grid gap-4">
-                            {tasks.length === 0 ? (
-                                <p className="text-gray-500 text-center py-10">No pending tasks requiring approval.</p>
-                            ) : (
-                                tasks.map(task => (
-                                    <div key={task.id} className="bg-gray-800/80 border border-gray-700 rounded-xl p-6">
-                                        <div className="flex justify-between items-start">
-                                            <div className="flex-1">
-                                                <div className="flex items-center gap-3 mb-2">
-                                                    <span className="bg-yellow-500/20 text-yellow-300 text-xs px-2 py-1 rounded-full border border-yellow-500/30">PENDING</span>
-                                                    <span className="text-gray-400 text-sm">{new Date(task.createdAt).toLocaleString()}</span>
-                                                    <span className="text-purple-400 text-sm font-bold">@{task.agent?.name || 'System'}</span>
+                    <div className="max-w-6xl mx-auto space-y-8">
+                        {/* ── SECTION 1: Pending Approvals with SLA Timer ──── */}
+                        <div>
+                            <h2 className="text-2xl font-bold mb-4">🔒 Pending Approvals (HITL)</h2>
+                            <div className="grid gap-4">
+                                {tasks.length === 0 ? (
+                                    <p className="text-gray-500 text-center py-8 bg-gray-800/30 rounded-xl border border-gray-700/50">No pending tasks requiring approval.</p>
+                                ) : (
+                                    tasks.map(task => {
+                                        const sla = getSlaInfo(task.createdAt);
+                                        return (
+                                            <div key={task.id} className="bg-gray-800/80 border border-gray-700 rounded-xl p-6">
+                                                <div className="flex justify-between items-start">
+                                                    <div className="flex-1">
+                                                        <div className="flex items-center gap-3 mb-2 flex-wrap">
+                                                            <span className="bg-yellow-500/20 text-yellow-300 text-xs px-2 py-1 rounded-full border border-yellow-500/30">PENDING</span>
+                                                            <span className={`text-xs px-2 py-1 rounded-full border font-mono ${sla.color}`}>⏱ {sla.display} ago</span>
+                                                            <span className="text-gray-400 text-sm">{new Date(task.createdAt).toLocaleString()}</span>
+                                                            <span className="text-purple-400 text-sm font-bold">@{task.agent?.name || 'System'}</span>
+                                                        </div>
+                                                        <p className="text-lg">{task.description}</p>
+                                                    </div>
+                                                    <div className="flex gap-3 ml-4">
+                                                        <button onClick={() => handleEditTask(task)} className={`px-4 py-2 border rounded-lg transition-colors text-sm ${editingTaskId === task.id ? 'bg-blue-700 border-blue-500 text-white' : 'bg-blue-900/50 border-blue-600 text-blue-300 hover:bg-blue-800'}`}>
+                                                            {editingTaskId === task.id ? 'Close Editor' : '✏️ Edit'}
+                                                        </button>
+                                                        <button onClick={() => handleVote(task.id, 'reject')} className="px-4 py-2 bg-red-900/50 border border-red-600 text-red-300 rounded-lg hover:bg-red-800 transition-colors">Reject</button>
+                                                        <button onClick={() => handleVote(task.id, 'approve')} className="px-4 py-2 bg-green-900/50 border border-green-600 text-green-300 rounded-lg hover:bg-green-800 transition-colors">Approve</button>
+                                                    </div>
                                                 </div>
-                                                <p className="text-lg">{task.description}</p>
-                                            </div>
-                                            <div className="flex gap-3 ml-4">
-                                                <button onClick={() => handleEditTask(task)} className={`px-4 py-2 border rounded-lg transition-colors text-sm ${editingTaskId === task.id ? 'bg-blue-700 border-blue-500 text-white' : 'bg-blue-900/50 border-blue-600 text-blue-300 hover:bg-blue-800'}`}>
-                                                    {editingTaskId === task.id ? 'Close Editor' : '✏️ Edit Payload'}
-                                                </button>
-                                                <button onClick={() => handleVote(task.id, 'reject')} className="px-4 py-2 bg-red-900/50 border border-red-600 text-red-300 rounded-lg hover:bg-red-800 transition-colors">Reject</button>
-                                                <button onClick={() => handleVote(task.id, 'approve')} className="px-4 py-2 bg-green-900/50 border border-green-600 text-green-300 rounded-lg hover:bg-green-800 transition-colors">Approve</button>
-                                            </div>
-                                        </div>
 
-                                        {/* Expandable Payload Editor */}
-                                        {editingTaskId === task.id && (
-                                            <div className="mt-4 p-4 bg-gray-900/60 border border-gray-600 rounded-xl space-y-3 animate-in">
-                                                <div className="flex justify-between items-center">
-                                                    <label className="text-sm font-medium text-gray-300">Input Payload (JSON)</label>
-                                                    <span className="text-xs text-gray-500">Edit the payload before approving</span>
-                                                </div>
-                                                <textarea
-                                                    value={editingPayload}
-                                                    onChange={(e) => setEditingPayload(e.target.value)}
-                                                    rows={8}
-                                                    className="w-full px-4 py-3 bg-gray-800 border border-gray-600 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none font-mono text-sm text-green-300 whitespace-pre"
-                                                />
-                                                <div className="flex gap-3">
-                                                    <button
-                                                        onClick={() => handleSaveTaskEdit(task.id)}
-                                                        disabled={savingTask}
-                                                        className="px-6 py-2 bg-gradient-to-r from-blue-600 to-cyan-600 hover:from-blue-700 hover:to-cyan-700 rounded-lg font-bold text-white text-sm transition-all disabled:opacity-50"
-                                                    >
-                                                        {savingTask ? 'Saving...' : '💾 Save Edit'}
+                                                {/* Expandable Payload Editor */}
+                                                {editingTaskId === task.id && (
+                                                    <div className="mt-4 p-4 bg-gray-900/60 border border-gray-600 rounded-xl space-y-3">
+                                                        <div className="flex justify-between items-center">
+                                                            <label className="text-sm font-medium text-gray-300">Input Payload (JSON)</label>
+                                                            <span className="text-xs text-gray-500">Edit the payload before approving</span>
+                                                        </div>
+                                                        <textarea value={editingPayload} onChange={(e) => setEditingPayload(e.target.value)} rows={6} className="w-full px-4 py-3 bg-gray-800 border border-gray-600 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none font-mono text-sm text-green-300 whitespace-pre" />
+                                                        <div className="flex gap-3">
+                                                            <button onClick={() => handleSaveTaskEdit(task.id)} disabled={savingTask} className="px-6 py-2 bg-gradient-to-r from-blue-600 to-cyan-600 hover:from-blue-700 hover:to-cyan-700 rounded-lg font-bold text-white text-sm transition-all disabled:opacity-50">
+                                                                {savingTask ? 'Saving...' : '💾 Save Edit'}
+                                                            </button>
+                                                            <button onClick={() => setEditingPayload(JSON.stringify(task.inputPayload || {}, null, 2))} className="px-4 py-2 bg-gray-700 hover:bg-gray-600 border border-gray-600 text-gray-300 rounded-lg text-sm transition-colors">Reset</button>
+                                                        </div>
+                                                    </div>
+                                                )}
+
+                                                {/* Comments Section */}
+                                                <div className="mt-4 border-t border-gray-700/50 pt-3">
+                                                    <button onClick={() => setCommentingTaskId(commentingTaskId === task.id ? null : task.id)} className="text-xs text-gray-400 hover:text-gray-200 transition-colors">
+                                                        💬 {(task as any).comments?.length || 0} Notes {commentingTaskId === task.id ? '▲' : '▼'}
                                                     </button>
-                                                    <button
-                                                        onClick={() => setEditingPayload(JSON.stringify(task.inputPayload || {}, null, 2))}
-                                                        className="px-4 py-2 bg-gray-700 hover:bg-gray-600 border border-gray-600 text-gray-300 rounded-lg text-sm transition-colors"
-                                                    >
-                                                        Reset
-                                                    </button>
+                                                    {commentingTaskId === task.id && (
+                                                        <div className="mt-3 space-y-2">
+                                                            {((task as any).comments || []).map((c: any, ci: number) => (
+                                                                <div key={ci} className="text-sm bg-gray-900/40 p-3 rounded-lg border border-gray-700/30">
+                                                                    <span className="text-purple-400 font-medium">{c.author}</span>
+                                                                    <span className="text-gray-500 text-xs ml-2">{new Date(c.timestamp).toLocaleString()}</span>
+                                                                    <p className="text-gray-300 mt-1">{c.text}</p>
+                                                                </div>
+                                                            ))}
+                                                            <div className="flex gap-2 mt-2">
+                                                                <input value={commentText} onChange={e => setCommentText(e.target.value)} placeholder="Add a note..." className="flex-1 px-3 py-2 bg-gray-900/50 border border-gray-600 rounded-lg text-sm outline-none focus:ring-1 focus:ring-purple-500" onKeyDown={e => e.key === 'Enter' && handleAddComment(task.id)} />
+                                                                <button onClick={() => handleAddComment(task.id)} className="px-4 py-2 bg-purple-700 hover:bg-purple-600 text-white text-sm rounded-lg transition-colors">Add</button>
+                                                            </div>
+                                                        </div>
+                                                    )}
                                                 </div>
                                             </div>
+                                        );
+                                    })
+                                )}
+                            </div>
+                        </div>
+
+                        {/* ── SECTION 2: Task History with Filters ──────── */}
+                        <div className="bg-gray-800/50 border border-gray-700 rounded-2xl p-6">
+                            <h3 className="text-xl font-bold mb-4">📋 Task History</h3>
+                            {/* Filter Bar */}
+                            <div className="flex flex-wrap gap-3 mb-4">
+                                <select value={taskStatusFilter} onChange={e => { setTaskStatusFilter(e.target.value); setTimeout(fetchAllTasks, 50); }} className="px-3 py-2 bg-gray-900/50 border border-gray-600 rounded-lg text-sm outline-none">
+                                    <option value="ALL">All Statuses</option>
+                                    <option value="PENDING">Pending</option>
+                                    <option value="APPROVED">Approved</option>
+                                    <option value="COMPLETED">Completed</option>
+                                    <option value="REJECTED">Rejected</option>
+                                </select>
+                                <select value={taskAgentFilter} onChange={e => { setTaskAgentFilter(e.target.value); setTimeout(fetchAllTasks, 50); }} className="px-3 py-2 bg-gray-900/50 border border-gray-600 rounded-lg text-sm outline-none">
+                                    <option value="">All Agents</option>
+                                    {agents.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+                                </select>
+                                <input value={taskSearchQuery} onChange={e => setTaskSearchQuery(e.target.value)} onKeyDown={e => e.key === 'Enter' && fetchAllTasks()} placeholder="🔍 Search tasks..." className="flex-1 min-w-[200px] px-3 py-2 bg-gray-900/50 border border-gray-600 rounded-lg text-sm outline-none" />
+                                <button onClick={fetchAllTasks} className="px-4 py-2 bg-purple-700 hover:bg-purple-600 text-white text-sm rounded-lg transition-colors">Search</button>
+                            </div>
+                            {/* Task List */}
+                            <div className="overflow-x-auto">
+                                <table className="w-full text-left text-sm text-gray-400">
+                                    <thead className="bg-gray-900/50 uppercase font-medium text-xs">
+                                        <tr>
+                                            <th className="px-4 py-3">Status</th>
+                                            <th className="px-4 py-3">Description</th>
+                                            <th className="px-4 py-3">Agent</th>
+                                            <th className="px-4 py-3">Actioned By</th>
+                                            <th className="px-4 py-3">Created</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-gray-700">
+                                        {allTasks.length === 0 && (
+                                            <tr><td colSpan={5} className="px-4 py-6 text-center text-gray-500">No tasks match your filters.</td></tr>
                                         )}
-                                    </div>
-                                ))
-                            )}
+                                        {allTasks.map((t: any) => {
+                                            const statusColors: any = { PENDING: 'bg-yellow-900/30 border-yellow-500 text-yellow-400', APPROVED: 'bg-blue-900/30 border-blue-500 text-blue-400', COMPLETED: 'bg-green-900/30 border-green-500 text-green-400', REJECTED: 'bg-red-900/30 border-red-500 text-red-400' };
+                                            return (
+                                                <tr key={t.id} className="hover:bg-gray-700/30">
+                                                    <td className="px-4 py-3"><span className={`px-2 py-1 rounded-full text-xs border ${statusColors[t.status] || 'text-gray-400 border-gray-600'}`}>{t.status}</span></td>
+                                                    <td className="px-4 py-3 text-white max-w-[300px] truncate">{t.description}</td>
+                                                    <td className="px-4 py-3 text-purple-400">{t.agent?.name || '—'}</td>
+                                                    <td className="px-4 py-3">{t.actionedBy || '—'}</td>
+                                                    <td className="px-4 py-3 text-xs">{new Date(t.createdAt).toLocaleString()}</td>
+                                                </tr>
+                                            );
+                                        })}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+
+                        {/* ── SECTION 3: Audit Log ─────────────────────── */}
+                        <div className="bg-gray-800/50 border border-gray-700 rounded-2xl p-6">
+                            <h3 className="text-xl font-bold mb-4">📜 Audit Log</h3>
+                            <div className="overflow-x-auto">
+                                <table className="w-full text-left text-sm text-gray-400">
+                                    <thead className="bg-gray-900/50 uppercase font-medium text-xs">
+                                        <tr>
+                                            <th className="px-4 py-3">Action</th>
+                                            <th className="px-4 py-3">Entity</th>
+                                            <th className="px-4 py-3">Performed By</th>
+                                            <th className="px-4 py-3">Details</th>
+                                            <th className="px-4 py-3">Time</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-gray-700">
+                                        {auditLogs.length === 0 && (
+                                            <tr><td colSpan={5} className="px-4 py-6 text-center text-gray-500">No audit entries yet. Approve or reject a task to generate entries.</td></tr>
+                                        )}
+                                        {auditLogs.map((log: any) => {
+                                            const actionColors: any = { APPROVE: 'text-green-400', REJECT: 'text-red-400', EDIT: 'text-blue-400', COMMENT: 'text-purple-400' };
+                                            return (
+                                                <tr key={log.id} className="hover:bg-gray-700/30">
+                                                    <td className={`px-4 py-3 font-bold ${actionColors[log.action] || 'text-gray-400'}`}>{log.action}</td>
+                                                    <td className="px-4 py-3"><span className="text-xs font-mono text-gray-500">{log.entityType}</span> <span className="text-xs text-gray-600">{log.entityId.substring(0, 8)}...</span></td>
+                                                    <td className="px-4 py-3 text-white">{log.performedBy}</td>
+                                                    <td className="px-4 py-3 text-xs max-w-[250px] truncate">{log.details ? (log.details.description || log.details.comment?.text || JSON.stringify(log.details).substring(0, 60)) : '—'}</td>
+                                                    <td className="px-4 py-3 text-xs">{new Date(log.createdAt).toLocaleString()}</td>
+                                                </tr>
+                                            );
+                                        })}
+                                    </tbody>
+                                </table>
+                            </div>
                         </div>
                     </div>
                 )}
@@ -912,19 +1109,51 @@ function App() {
                                             <tr><td colSpan={6} className="px-4 py-6 text-center text-gray-500">No traces yet. Send a webhook via the Ingress Gateway to generate traces.</td></tr>
                                         )}
                                         {stats.traces.map((trace: any) => (
-                                            <tr key={trace.id} className="hover:bg-gray-700/30">
-                                                <td className="px-4 py-3">{new Date(trace.startedAt).toLocaleTimeString()}</td>
-                                                <td className="px-4 py-3 text-white">{trace.service}</td>
-                                                <td className="px-4 py-3">{trace.operation}</td>
-                                                <td className="px-4 py-3">
-                                                    <span className={`px-2 py-1 rounded-full text-xs border ${trace.status === 'OK' ? 'bg-green-900/30 border-green-500 text-green-400' : 'bg-red-900/30 border-red-500 text-red-400'
-                                                        }`}>
-                                                        {trace.status}
-                                                    </span>
-                                                </td>
-                                                <td className="px-4 py-3">{trace.durationMs}ms</td>
-                                                <td className="px-4 py-3 font-mono text-xs opacity-50">{trace.traceId.substring(0, 8)}...</td>
-                                            </tr>
+                                            <React.Fragment key={trace.id}>
+                                                <tr className="hover:bg-gray-700/30 cursor-pointer" onClick={() => { if (expandedTraceId === trace.traceId) { setExpandedTraceId(null); setTraceSpans([]); } else { setExpandedTraceId(trace.traceId); fetchTraceSpans(trace.traceId); } }}>
+                                                    <td className="px-4 py-3">{new Date(trace.startedAt).toLocaleTimeString()}</td>
+                                                    <td className="px-4 py-3 text-white">{trace.service}</td>
+                                                    <td className="px-4 py-3">{trace.operation}</td>
+                                                    <td className="px-4 py-3">
+                                                        <span className={`px-2 py-1 rounded-full text-xs border ${trace.status === 'OK' ? 'bg-green-900/30 border-green-500 text-green-400' : 'bg-red-900/30 border-red-500 text-red-400'}`}>
+                                                            {trace.status}
+                                                        </span>
+                                                    </td>
+                                                    <td className="px-4 py-3">{trace.durationMs}ms</td>
+                                                    <td className="px-4 py-3 font-mono text-xs opacity-50">{trace.traceId.substring(0, 8)}... {expandedTraceId === trace.traceId ? '▲' : '▼'}</td>
+                                                </tr>
+                                                {/* Expanded Span Viewer */}
+                                                {expandedTraceId === trace.traceId && (
+                                                    <tr>
+                                                        <td colSpan={6} className="p-0">
+                                                            <div className="bg-gray-900/70 px-6 py-4 border-t border-b border-purple-500/20">
+                                                                <p className="text-xs text-purple-400 font-medium mb-3">Span Waterfall — {traceSpans.length} span(s)</p>
+                                                                {traceSpans.length === 0 ? (
+                                                                    <p className="text-xs text-gray-500">No spans recorded for this trace.</p>
+                                                                ) : (
+                                                                    <div className="space-y-1">
+                                                                        {traceSpans.map((span: any, si: number) => {
+                                                                            const maxDur = Math.max(...traceSpans.map((s: any) => s.durationMs || 1), 1);
+                                                                            const widthPct = Math.max(((span.durationMs || 1) / maxDur) * 100, 3);
+                                                                            return (
+                                                                                <div key={span.id} className="flex items-center gap-3 text-xs" style={{ paddingLeft: `${(si > 0 && span.parentId ? 24 : 0)}px` }}>
+                                                                                    <span className="w-24 text-gray-500 shrink-0">{span.service}</span>
+                                                                                    <span className="w-36 text-gray-400 truncate shrink-0">{span.operation}</span>
+                                                                                    <div className="flex-1 bg-gray-800 rounded overflow-hidden h-5 relative">
+                                                                                        <div className={`h-full rounded ${span.status === 'OK' ? 'bg-gradient-to-r from-purple-600 to-cyan-500' : 'bg-gradient-to-r from-red-600 to-red-400'}`} style={{ width: `${widthPct}%` }}></div>
+                                                                                        <span className="absolute inset-0 flex items-center px-2 text-[10px] text-white font-mono">{span.durationMs}ms</span>
+                                                                                    </div>
+                                                                                    <span className={`w-12 text-center ${span.status === 'OK' ? 'text-green-500' : 'text-red-400'}`}>{span.status}</span>
+                                                                                </div>
+                                                                            );
+                                                                        })}
+                                                                    </div>
+                                                                )}
+                                                            </div>
+                                                        </td>
+                                                    </tr>
+                                                )}
+                                            </React.Fragment>
                                         ))}
                                     </tbody>
                                 </table>
@@ -1023,6 +1252,91 @@ function App() {
                                 </div>
                             ) : (
                                 <p className="text-gray-500">Loading reconciliation data...</p>
+                            )}
+                        </div>
+
+                        {/* ── Error Log Feed ──────────────────────────── */}
+                        <div className="bg-gray-800/50 border border-gray-700 rounded-2xl p-6">
+                            <h3 className="text-xl font-bold mb-4">🔴 Error Log Feed</h3>
+                            <div className="overflow-x-auto max-h-[300px] overflow-y-auto">
+                                <table className="w-full text-left text-sm text-gray-400">
+                                    <thead className="bg-gray-900/50 uppercase font-medium text-xs sticky top-0">
+                                        <tr>
+                                            <th className="px-4 py-3">Time</th>
+                                            <th className="px-4 py-3">Service</th>
+                                            <th className="px-4 py-3">Operation</th>
+                                            <th className="px-4 py-3">Message</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-gray-700">
+                                        {errorLogs.length === 0 && (
+                                            <tr><td colSpan={4} className="px-4 py-6 text-center text-gray-500">No errors recorded. This is a good thing! 🎉</td></tr>
+                                        )}
+                                        {errorLogs.map((err: any) => (
+                                            <tr key={err.id} className="hover:bg-red-900/10">
+                                                <td className="px-4 py-3 text-xs whitespace-nowrap">{new Date(err.createdAt).toLocaleString()}</td>
+                                                <td className="px-4 py-3 text-white">{err.service}</td>
+                                                <td className="px-4 py-3">{err.operation}</td>
+                                                <td className="px-4 py-3 text-red-400 max-w-[400px] truncate font-mono text-xs">{err.message}</td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+
+                        {/* ── Agent Activity Timeline ─────────────────── */}
+                        <div className="bg-gray-800/50 border border-gray-700 rounded-2xl p-6">
+                            <h3 className="text-xl font-bold mb-4">📅 Agent Activity Timeline</h3>
+                            <div className="flex gap-3 mb-4">
+                                <select value={activityAgentId} onChange={e => { setActivityAgentId(e.target.value); if (e.target.value) fetchAgentActivity(e.target.value); else setActivityTimeline([]); }} className="px-3 py-2 bg-gray-900/50 border border-gray-600 rounded-lg text-sm outline-none">
+                                    <option value="">Select an agent...</option>
+                                    {agents.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+                                </select>
+                            </div>
+                            {activityAgentId && activityTimeline.length === 0 && (
+                                <p className="text-gray-500 text-center py-6">No activity recorded for this agent yet.</p>
+                            )}
+                            {activityTimeline.length > 0 && (
+                                <div className="relative border-l-2 border-gray-700 ml-4 space-y-4 max-h-[400px] overflow-y-auto">
+                                    {activityTimeline.map((event: any) => {
+                                        const icons: any = { message: '💬', task: '🔒', usage: '⚡' };
+                                        const colors: any = { message: 'border-blue-500', task: 'border-yellow-500', usage: 'border-purple-500' };
+                                        return (
+                                            <div key={event.id} className="relative pl-8">
+                                                <span className={`absolute -left-[9px] w-4 h-4 rounded-full bg-gray-900 border-2 ${colors[event.type] || 'border-gray-500'} top-1`}></span>
+                                                <div className={`bg-gray-900/40 p-3 rounded-lg border border-gray-700/30 ${event.type === 'message' ? 'cursor-pointer hover:border-gray-600' : ''}`}
+                                                    onClick={() => { if (event.type === 'message') { if (expandedMessageId === event.id) { setExpandedMessageId(null); setMessageDetail(null); } else { setExpandedMessageId(event.id); fetchMessageDetail(event.id); } } }}>
+                                                    <div className="flex items-center gap-2 text-xs">
+                                                        <span>{icons[event.type] || '•'}</span>
+                                                        <span className="text-gray-400">{new Date(event.timestamp).toLocaleString()}</span>
+                                                        <span className="text-gray-600">|</span>
+                                                        {event.type === 'message' && <span className={`${event.data.role === 'user' ? 'text-cyan-400' : 'text-green-400'}`}>{event.data.role}</span>}
+                                                        {event.type === 'task' && <span className="text-yellow-400">{event.data.status}</span>}
+                                                        {event.type === 'usage' && <span className="text-purple-400">{event.data.action}</span>}
+                                                    </div>
+                                                    <p className="text-sm text-gray-300 mt-1 truncate">
+                                                        {event.type === 'message' && (event.data.content?.substring(0, 120) + (event.data.content?.length > 120 ? '...' : ''))}
+                                                        {event.type === 'task' && event.data.description}
+                                                        {event.type === 'usage' && `${event.data.tokens} tokens · $${event.data.costUsd?.toFixed(6) || '0'}`}
+                                                    </p>
+                                                    {/* Request/Response Inspector */}
+                                                    {event.type === 'message' && expandedMessageId === event.id && messageDetail && (
+                                                        <div className="mt-3 p-3 bg-gray-800/80 rounded-lg border border-gray-600/30 space-y-2">
+                                                            <p className="text-xs text-purple-400 font-medium">📋 Message Inspector</p>
+                                                            <div className="grid grid-cols-3 gap-2 text-xs">
+                                                                <div><span className="text-gray-500">Role:</span> <span className="text-white">{messageDetail.role}</span></div>
+                                                                <div><span className="text-gray-500">Tokens:</span> <span className="text-white">{messageDetail.tokens}</span></div>
+                                                                <div><span className="text-gray-500">Cost:</span> <span className="text-green-400">${messageDetail.cost?.toFixed(6) || '0'}</span></div>
+                                                            </div>
+                                                            <pre className="text-xs text-green-300 bg-gray-900 p-3 rounded-lg overflow-x-auto max-h-[200px] overflow-y-auto whitespace-pre-wrap font-mono">{messageDetail.content}</pre>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
                             )}
                         </div>
                     </div>

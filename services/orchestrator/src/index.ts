@@ -411,7 +411,7 @@ app.post<{ Body: AgentPayload }>('/api/agents', async (request, reply) => {
             // Store ADK resource name on Agent model (Architecture Spec)
             await prisma.agent.update({
                 where: { id: agent.id },
-                data: { adkResourceName: resourceName }
+                data: { adkResourceName: resourceName } as any
             });
 
         } catch (cxErr: any) {
@@ -890,8 +890,19 @@ app.post<{ Params: { id: string } }>('/api/tasks/:id/approve', async (req, rep) 
     try {
         const task = await prisma.task.update({
             where: { id },
-            data: { status: 'APPROVED' },
+            data: { status: 'APPROVED', actionedBy: 'admin', actionedAt: new Date() },
             include: { agent: true }
+        });
+
+        // ── AUDIT LOG ────────────────────────────────────────────────
+        await prisma.auditLog.create({
+            data: {
+                action: 'APPROVE',
+                entityType: 'TASK',
+                entityId: id,
+                performedBy: 'admin',
+                details: { description: task.description, agentName: task.agent?.name },
+            },
         });
 
         // ── INLINE EXECUTION: Execute the approved action directly ────
@@ -959,10 +970,6 @@ app.post<{ Params: { id: string } }>('/api/tasks/:id/approve', async (req, rep) 
 
         console.log(`📢 Task ${task.id} approved and executed inline (Agent: ${task.agent?.name})`);
 
-        // NOTE: Removed Pub/Sub RESUME publish — the email is already sent inline above.
-        // Publishing RESUME here caused duplicate email sends because the Pub/Sub handler
-        // also executes the same email logic.
-
         return { ...task, status: 'COMPLETED', executionResult: toolOutput };
     } catch (e) {
         console.error(e);
@@ -975,8 +982,21 @@ app.post<{ Params: { id: string } }>('/api/tasks/:id/reject', async (req, rep) =
     try {
         const task = await prisma.task.update({
             where: { id },
-            data: { status: 'REJECTED' }
+            data: { status: 'REJECTED', actionedBy: 'admin', actionedAt: new Date() },
+            include: { agent: true }
         });
+
+        // ── AUDIT LOG ────────────────────────────────────────────────
+        await prisma.auditLog.create({
+            data: {
+                action: 'REJECT',
+                entityType: 'TASK',
+                entityId: id,
+                performedBy: 'admin',
+                details: { description: task.description, agentName: task.agent?.name },
+            },
+        });
+
         return task;
     } catch (e) {
         return rep.status(404).send({ error: 'Task not found' });
@@ -1008,12 +1028,187 @@ app.put<{ Params: { id: string }, Body: { inputPayload?: any; description?: stri
             include: { agent: true }
         });
 
+        // ── AUDIT LOG ────────────────────────────────────────────────
+        await prisma.auditLog.create({
+            data: {
+                action: 'EDIT',
+                entityType: 'TASK',
+                entityId: id,
+                performedBy: 'admin',
+                details: { oldPayload: existing.inputPayload, newPayload: inputPayload },
+            },
+        });
+
         console.log(`✏️ Task ${id} payload edited before approval`);
         return task;
     } catch (e) {
         console.error(e);
         return rep.status(500).send({ error: 'Failed to update task' });
     }
+});
+
+// ── GOVERNANCE: Audit Log History ────────────────────────────────────
+app.get('/api/audit-logs', async (req, _rep) => {
+    const query = req.query as any;
+    const limit = parseInt(query.limit) || 50;
+    const where: any = {};
+    if (query.entityType) where.entityType = query.entityType;
+    if (query.entityId) where.entityId = query.entityId;
+    if (query.action) where.action = query.action;
+
+    const logs = await prisma.auditLog.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        take: limit,
+    });
+    return logs;
+});
+
+// ── GOVERNANCE: All Tasks (with filters) ─────────────────────────────
+app.get('/api/tasks/all', async (req, _rep) => {
+    const query = req.query as any;
+    const where: any = {};
+
+    if (query.status && query.status !== 'ALL') {
+        where.status = query.status;
+    }
+    if (query.agentId) {
+        where.agentId = query.agentId;
+    }
+    if (query.search) {
+        where.description = { contains: query.search, mode: 'insensitive' };
+    }
+    if (query.from) {
+        where.createdAt = { ...(where.createdAt || {}), gte: new Date(query.from) };
+    }
+    if (query.to) {
+        where.createdAt = { ...(where.createdAt || {}), lte: new Date(query.to) };
+    }
+
+    const tasks = await prisma.task.findMany({
+        where,
+        include: { agent: { select: { name: true } } },
+        orderBy: { createdAt: 'desc' },
+        take: parseInt(query.limit) || 100,
+    });
+    return tasks;
+});
+
+// ── GOVERNANCE: Add Comment to Task ──────────────────────────────────
+app.post<{ Params: { id: string }; Body: { author?: string; text: string } }>('/api/tasks/:id/comment', async (req, rep) => {
+    const { id } = req.params;
+    const { author, text } = req.body;
+
+    if (!text?.trim()) {
+        return rep.status(400).send({ error: 'Comment text is required' });
+    }
+
+    try {
+        const task = await prisma.task.findUnique({ where: { id } });
+        if (!task) return rep.status(404).send({ error: 'Task not found' });
+
+        const existingComments: any[] = (task.comments as any[]) || [];
+        const newComment = { author: author || 'admin', text: text.trim(), timestamp: new Date().toISOString() };
+        existingComments.push(newComment);
+
+        const updated = await prisma.task.update({
+            where: { id },
+            data: { comments: existingComments },
+            include: { agent: { select: { name: true } } },
+        });
+
+        // Audit log
+        await prisma.auditLog.create({
+            data: {
+                action: 'COMMENT',
+                entityType: 'TASK',
+                entityId: id,
+                performedBy: author || 'admin',
+                details: { comment: newComment },
+            },
+        });
+
+        return updated;
+    } catch (e) {
+        console.error(e);
+        return rep.status(500).send({ error: 'Failed to add comment' });
+    }
+});
+
+// ── OBSERVABILITY: Trace Span Viewer ─────────────────────────────────
+app.get<{ Params: { traceId: string } }>('/api/traces/:traceId/spans', async (req, _rep) => {
+    const { traceId } = req.params;
+    const spans = await prisma.traceSpan.findMany({
+        where: { traceId },
+        orderBy: { startedAt: 'asc' },
+    });
+    return spans;
+});
+
+// ── OBSERVABILITY: Error Log Feed ────────────────────────────────────
+app.get('/api/error-logs', async (req, _rep) => {
+    const query = req.query as any;
+    const limit = parseInt(query.limit) || 50;
+    const where: any = {};
+    if (query.service) where.service = query.service;
+    if (query.agentId) where.agentId = query.agentId;
+
+    const errors = await prisma.errorLog.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        take: limit,
+    });
+    return errors;
+});
+
+// ── OBSERVABILITY: Agent Activity Timeline ───────────────────────────
+app.get<{ Params: { id: string } }>('/api/agents/:id/activity', async (req, _rep) => {
+    const { id } = req.params;
+    const query = req.query as any;
+    const limit = parseInt(query.limit) || 50;
+
+    // Fetch messages, tasks, and usage logs in parallel
+    const [messages, tasks, usageLogs] = await Promise.all([
+        prisma.message.findMany({
+            where: { agentId: id },
+            orderBy: { createdAt: 'desc' },
+            take: limit,
+            select: { id: true, role: true, content: true, tokens: true, cost: true, createdAt: true },
+        }),
+        prisma.task.findMany({
+            where: { agentId: id },
+            orderBy: { createdAt: 'desc' },
+            take: limit,
+            select: { id: true, description: true, status: true, actionedBy: true, actionedAt: true, createdAt: true },
+        }),
+        prisma.usageLog.findMany({
+            where: { agentId: id },
+            orderBy: { createdAt: 'desc' },
+            take: limit,
+            select: { id: true, action: true, tokens: true, costUsd: true, createdAt: true },
+        }),
+    ]);
+
+    // Merge into a unified timeline
+    const timeline = [
+        ...messages.map(m => ({ type: 'message' as const, id: m.id, timestamp: m.createdAt, data: m })),
+        ...tasks.map(t => ({ type: 'task' as const, id: t.id, timestamp: t.createdAt, data: t })),
+        ...usageLogs.map(u => ({ type: 'usage' as const, id: u.id, timestamp: u.createdAt, data: u })),
+    ].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+     .slice(0, limit);
+
+    return timeline;
+});
+
+// ── OBSERVABILITY: Message Detail Inspector ──────────────────────────
+app.get<{ Params: { id: string } }>('/api/messages/:id/detail', async (req, rep) => {
+    const { id } = req.params;
+    const message = await prisma.message.findUnique({
+        where: { id },
+        include: { agent: { select: { name: true, role: true } } },
+    });
+    if (!message) return rep.status(404).send({ error: 'Message not found' });
+    return message;
 });
 
 // 3. OBSERVABILITY: Dashboard Stats
@@ -1545,6 +1740,20 @@ async function processChat(data: { type: string; agentId: string; message: strin
     } catch (err: any) {
         opStatus = 'ERROR';
         console.error('❌ processChat error:', err);
+
+        // Record error for Error Log Feed
+        await prisma.errorLog.create({
+            data: {
+                service: 'orchestrator',
+                operation: 'chat_completion',
+                agentId: data.agentId,
+                traceId: data.traceId || null,
+                message: err.message || String(err),
+                stack: err.stack || null,
+                metadata: { inputMessage: data.message?.substring(0, 200) },
+            },
+        }).catch((e: any) => console.error('Failed to log ErrorLog:', e));
+
         throw err;
     } finally {
         if (data.traceId) {

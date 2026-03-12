@@ -274,6 +274,7 @@ class EGAPReasoningApp:
         """
         self._config = agent_config
         self._agent = None
+        self.agent_framework = "google-adk"  # Identify as ADK to trigger proper Vertex AI tracking
 
     def _ensure_vertex_auth(self):
         """Ensure the google-genai SDK used by ADK uses Vertex AI auth."""
@@ -290,6 +291,18 @@ class EGAPReasoningApp:
 
     def set_up(self):
         """Called automatically by Vertex AI when the container starts."""
+        import os
+        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or self._config.get("project_id") or os.getenv("PROJECT_ID", "gls-training-486405")
+        try:
+            from vertexai.agent_engines.templates.adk import _default_instrumentor_builder
+            self.instrumentor = _default_instrumentor_builder(
+                project_id=project_id,
+                enable_tracing=True,
+                enable_logging=True
+            )
+        except Exception as e:
+            pass # Keep deployment alive if telemetry fails
+            
         self._ensure_vertex_auth()
 
     def _get_agent(self) -> Agent:
@@ -304,6 +317,7 @@ class EGAPReasoningApp:
         return self._agent
 
     async def query(self, input_text: str, user_id: str = "user") -> str:
+        """The main method used by the frontend and orchestrator."""
         self._ensure_vertex_auth()
         agent = self._get_agent()
         
@@ -384,17 +398,22 @@ def main():
     #    No extra_packages needed — all code is inlined, and cloudpickle
     #    only references standard pip-installable packages.
     try:
-        from vertexai.preview import reasoning_engines
+        from vertexai import agent_engines
 
-        remote_app = reasoning_engines.ReasoningEngine.create(
+        remote_app = agent_engines.create(
             app,
             requirements=[
                 "google-adk>=0.3.0",
-                "google-cloud-aiplatform>=1.62.0",
+                "google-cloud-aiplatform[agent_engines]>=1.62.0",
                 "google-cloud-storage>=2.14.0",
                 "google-genai>=1.0.0",
                 "requests>=2.31.0",
+                "opentelemetry-exporter-otlp-proto-http",
+                "opentelemetry-exporter-gcp-logging",
             ],
+            env_vars={
+                "GOOGLE_CLOUD_AGENT_ENGINE_ENABLE_TELEMETRY": "true"
+            },
             display_name=name,
             description=f"EGAP Agent: {role} — {goal}",
         )

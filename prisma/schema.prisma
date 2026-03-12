@@ -76,15 +76,18 @@ model Deployment {
 
 // Task model - represents a pending action for HITL governance
 model Task {
-  id           String   @id @default(uuid())
+  id           String    @id @default(uuid())
   description  String
-  status       String   @default("PENDING") // PENDING, APPROVED, REJECTED
+  status       String    @default("PENDING") // PENDING, APPROVED, REJECTED, COMPLETED
   inputPayload Json?
-  agent        Agent    @relation(fields: [agentId], references: [id])
+  agent        Agent     @relation(fields: [agentId], references: [id])
   agentId      String
-  traceId      String?  // For Reconciliation: Link to Ingress Trace
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  traceId      String?   // For Reconciliation: Link to Ingress Trace
+  actionedBy   String?   // Who approved/rejected (e.g., 'admin')
+  actionedAt   DateTime? // When the action was taken
+  comments     Json?     // Array of { author, text, timestamp }
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
 }
 
 // UsageLog model - FRS Cost Accounting: per-agent token tracking
@@ -132,4 +135,33 @@ model GlobalSettings {
   key       String   @unique // e.g., 'emergency_stop'
   value     Json     // e.g., { active: true, triggeredBy: 'admin', at: '...' }
   updatedAt DateTime @updatedAt
+}
+
+// AuditLog model - records all governance actions for compliance
+model AuditLog {
+  id          String   @id @default(uuid())
+  action      String   // APPROVE, REJECT, EDIT, COMMENT
+  entityType  String   // TASK, AGENT, etc.
+  entityId    String   // The ID of the task/agent acted upon
+  performedBy String   @default("admin")
+  details     Json?    // Extra context (e.g., old/new payload diff)
+  createdAt   DateTime @default(now())
+
+  @@index([entityType, entityId])
+}
+
+// ErrorLog model - captures errors across services for observability
+model ErrorLog {
+  id        String   @id @default(uuid())
+  service   String   // e.g., 'orchestrator', 'ingress'
+  operation String   // e.g., 'chat_completion', 'tool_call'
+  agentId   String?
+  traceId   String?
+  message   String   @db.Text
+  stack     String?  @db.Text
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  @@index([service])
+  @@index([agentId])
 }
