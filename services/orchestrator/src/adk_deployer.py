@@ -258,89 +258,11 @@ def _create_egap_agent(
 # Deployer main — Deploys to Vertex AI Agent Engine
 # ═════════════════════════════════════════════════════════════════════════════
 
-from google.adk.runners import InMemoryRunner
-from google.genai.types import Content, Part
+from vertexai.preview.reasoning_engines.templates.adk import AdkApp
+from google.adk.sessions.in_memory_session_service import InMemorySessionService
+from google.adk.artifacts.in_memory_artifact_service import InMemoryArtifactService
+from google.adk.memory.in_memory_memory_service import InMemoryMemoryService
 
-class EGAPReasoningApp:
-    """Minimal ReasoningEngine-compatible wrapper around an ADK Agent.
-    MUST be defined at the module level so Vertex AI AST extraction can find it.
-    """
-    def __init__(self, agent_config: dict):
-        """
-        ReasoningEngine App wrapper.
-        We store the config and create the Agent LACILY to ensure 
-        Vertex AI environment variables are set before the Agent's 
-        internal model client is initialized.
-        """
-        self._config = agent_config
-        self._agent = None
-        self.agent_framework = "google-adk"  # Identify as ADK to trigger proper Vertex AI tracking
-
-    def _ensure_vertex_auth(self):
-        """Ensure the google-genai SDK used by ADK uses Vertex AI auth."""
-        os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "1"
-        os.environ["GOOGLE_CLOUD_PROJECT"] = self._config.get("project_id") or os.getenv("PROJECT_ID", "gls-training-486405")
-        os.environ["GOOGLE_CLOUD_LOCATION"] = self._config.get("location") or os.getenv("LOCATION", "us-central1")
-        
-        # Also init the platform SDK just in case
-        import vertexai
-        vertexai.init(
-            project=os.environ["GOOGLE_CLOUD_PROJECT"],
-            location=os.environ["GOOGLE_CLOUD_LOCATION"],
-        )
-
-    def set_up(self):
-        """Called automatically by Vertex AI when the container starts."""
-        import os
-        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or self._config.get("project_id") or os.getenv("PROJECT_ID", "gls-training-486405")
-        try:
-            from vertexai.agent_engines.templates.adk import _default_instrumentor_builder
-            self.instrumentor = _default_instrumentor_builder(
-                project_id=project_id,
-                enable_tracing=True,
-                enable_logging=True
-            )
-        except Exception as e:
-            pass # Keep deployment alive if telemetry fails
-            
-        self._ensure_vertex_auth()
-
-    def _get_agent(self) -> Agent:
-        if self._agent is None:
-            self._ensure_vertex_auth()
-            self._agent = _create_egap_agent(
-                agent_id=self._config["agent_id"],
-                name=self._config["name"],
-                system_prompt=self._config["system_prompt"],
-                tool_names=self._config["tool_names"],
-            )
-        return self._agent
-
-    async def query(self, input_text: str, user_id: str = "user") -> str:
-        """The main method used by the frontend and orchestrator."""
-        self._ensure_vertex_auth()
-        agent = self._get_agent()
-        
-        runner = InMemoryRunner(
-            agent=agent,
-            app_name=agent.name,
-        )
-        session = await runner.session_service.create_session(
-            app_name=agent.name,
-            user_id=user_id,
-        )
-        content = Content(role="user", parts=[Part(text=input_text)])
-        final_response = ""
-        async for event in runner.run_async(
-            user_id=user_id,
-            session_id=session.id,
-            new_message=content,
-        ):
-            if hasattr(event, "content") and event.content:
-                for part in event.content.parts:
-                    if hasattr(part, "text") and part.text:
-                        final_response += part.text
-        return final_response or "No response generated."
 
 def main():
     if len(sys.argv) < 2:
@@ -381,18 +303,29 @@ def main():
     logger.info(f"🚀 Deploying ADK Agent: {name} (id={agent_id})")
     logger.info(f"   Tools: {tool_names}")
 
-    # 3. Create the Agent config for lazy initialization
-    agent_config = {
-        "agent_id": agent_id,
-        "name": name,
-        "system_prompt": sys_prompt,
-        "tool_names": tool_names,
-        "project_id": project_id,
-        "location": location,
-    }
+    # 3. Instantiate the agent locally for the AdkApp wrapper
+    # We set env vars first to ensure GenAI configures itself properly in Vertex mode
+    os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "1"
+    os.environ["GOOGLE_CLOUD_PROJECT"] = project_id
+    os.environ["GOOGLE_CLOUD_LOCATION"] = location
 
-    # 4. Wrap in EGAPReasoningApp (required by ReasoningEngine / Agent Engine)
-    app = EGAPReasoningApp(agent_config)
+    agent = _create_egap_agent(
+        agent_id=agent_id,
+        name=name,
+        system_prompt=sys_prompt,
+        tool_names=tool_names,
+    )
+
+    # 4. Wrap the Agent in AdkApp (required by ReasoningEngine / Agent Engine metrics)
+    app = AdkApp(
+        agent=agent,
+        env_vars={
+            "GOOGLE_CLOUD_AGENT_ENGINE_ENABLE_TELEMETRY": "true"
+        },
+        session_service_builder=InMemorySessionService,
+        artifact_service_builder=InMemoryArtifactService,
+        memory_service_builder=InMemoryMemoryService,
+    )
 
     # 5. Deploy to Vertex AI Agent Engine (ReasoningEngine)
     #    No extra_packages needed — all code is inlined, and cloudpickle

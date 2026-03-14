@@ -755,37 +755,120 @@ app.post<{ Body: ChatPayload }>('/api/chat', async (request, reply) => {
             (agentRecord as any)?.adkResourceName ||
             (deployment?.serviceUrl?.startsWith('projects/') ? deployment.serviceUrl : null);
 
-        if (!hasTools && adkResource) {
+        if (adkResource) {
             const agentPath = adkResource;
 
             console.log(`🌐 Routing chat to ADK Reasoning Engine: ${agentPath}`);
 
             try {
-                const result = await reasoningClient.queryReasoningEngine({
+                const responseStream = await reasoningClient.streamQueryReasoningEngine({
                     name: agentPath,
-                    classMethod: 'query',
+                    classMethod: 'stream_query',
                     input: {
                         fields: {
-                            input_text: {
-                                stringValue: message
-                            }
+                            user_id: { stringValue: 'orchestrator-user' },
+                            message: { stringValue: message }
                         }
                     }
                 });
-                const response = result[0];
 
-                // Extract reply text from the protobuf Struct response
-                let replyText = 'No response from ADK Agent.';
-                const anyResponse = response as any;
-                if (anyResponse?.output?.stringValue) {
-                    replyText = anyResponse.output.stringValue;
-                } else if (anyResponse?.output) {
-                    replyText = JSON.stringify(anyResponse.output);
+                let replyText = '';
+                for await (const chunk of responseStream as any) {
+                    // chunk.data is a Buffer directly (not chunk.data.data)
+                    if (chunk?.data && Buffer.isBuffer(chunk.data)) {
+                        try {
+                            const decoded = chunk.data.toString('utf-8');
+                            const eventJson = JSON.parse(decoded);
+                            
+                            // The agent response text is at content.parts[].text
+                            if (eventJson.content?.parts) {
+                                for (const part of eventJson.content.parts) {
+                                    if (part.text) {
+                                        replyText += part.text;
+                                    }
+                                }
+                            }
+                        } catch (e) {
+                            // If not valid JSON, append raw text
+                            replyText += chunk.data.toString('utf-8');
+                        }
+                    }
+                }
+
+                if (!replyText) {
+                    replyText = 'No reachable text in response stream.';
                 }
 
                 // Clean up stringified double quotes if they exist
-                if (replyText.startsWith('"') && replyText.endsWith('"')) {
+                if (replyText.startsWith('""') && replyText.endsWith('""')) {
+                    replyText = replyText.slice(2, -2);
+                } else if (replyText.startsWith('"') && replyText.endsWith('"')) {
                     replyText = replyText.slice(1, -1);
+                }
+
+                // If the stream threw a Python exception stack trace inline without failing grpc
+                if (replyText.includes('Traceback (most recent call last)')) {
+                    console.error("Agent engine returned a stack trace:", replyText);
+                    replyText = "The agent encountered an error during execution.";
+                }
+
+                // ── HYBRID HITL: Detect tool usage from Agent Engine text response ──
+                // The Agent Engine executes tools internally and returns only text.
+                // We scan the response for email-sending patterns and create HITL tasks locally.
+                const hasSendEmailTool = hasTools && agentRecord!.tools.some((t: any) => t.name === 'send_email');
+                // Broader pattern: detect phrases like "sent the email", "email sent", "I've sent the email", etc.
+                const emailSentPattern = /(?:sent|send|sending|delivered|dispatched).*?(?:email|mail|message)|(?:email|mail|message).*?(?:sent|send|sending|delivered|dispatched)/i;
+                const emailDetected = hasSendEmailTool && emailSentPattern.test(replyText);
+
+                if (emailDetected) {
+                    console.log(`🔒 HYBRID HITL: Detected email send in Agent Engine response`);
+                    console.log(`   Response text: "${replyText}"`);
+                    console.log(`   User message: "${message}"`);
+
+                    // Extract email parameters from USER MESSAGE (not the response, since the agent
+                    // often just says "I sent the email" without including the address)
+                    const toMatch = message.match(/([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/i)
+                        || replyText.match(/([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/i);
+                    const subjectMatch = message.match(/subject[:\s]+["']?([^"',]+)["']?/i) 
+                        || replyText.match(/subject\s+["']([^"']+)["']/i);
+                    const bodyMatch = message.match(/body[:\s]+["']?([^"',]+)["']?/i)
+                        || replyText.match(/body\s+["']([^"']+)["']/i);
+
+                    const emailTo = toMatch?.[1] || 'unknown';
+                    const emailSubject = subjectMatch?.[1] || '(no subject)';
+                    const emailBody = bodyMatch?.[1] || '(no body)';
+
+                    // Create HITL task in the database
+                    const task = await prisma.task.create({
+                        data: {
+                            description: `Agent wants to send email to ${emailTo}`,
+                            status: 'PENDING',
+                            agentId,
+                            inputPayload: { to: emailTo, subject: emailSubject, body: emailBody },
+                            traceId: traceId || null,
+                        }
+                    });
+
+                    // Rewrite the response to a system HITL message
+                    replyText = `[System] Usage of tool 'send_email' requires Admin Approval. Task ${task.id} created.`;
+
+                    // Broadcast WebSocket notification to all connected clients
+                    for (const [, socket] of activeConnections) {
+                        try {
+                            socket.send(JSON.stringify({
+                                type: 'hitl_task_created',
+                                task: {
+                                    id: task.id,
+                                    description: task.description,
+                                    status: 'PENDING',
+                                    agentId,
+                                    agentName: agentRecord?.name || 'Agent',
+                                }
+                            }));
+                        } catch (e) { /* ignore dead sockets */ }
+                    }
+
+                    console.log(`🔒 HITL Task ${task.id} created from Agent Engine response. Email to: ${emailTo}`);
                 }
 
                 // Save assistant message to DB so UI shows it
@@ -804,12 +887,9 @@ app.post<{ Body: ChatPayload }>('/api/chat', async (request, reply) => {
                 return reply.status(500).send({ error: 'ADK Agent execution failed' });
             }
         } else {
-            // FALLBACK: No deployment URL found, or agent has tools requiring inline HITL processing
-            if (hasTools) {
-                console.log(`⚙️ Agent ${agentId} has tools — using inline processing for function calling & HITL support.`);
-            } else {
-                console.log(`⚙️ No valid Managed Agent deployment for ${agentId}. Falling back to inline processing.`);
-            }
+            // FALLBACK: No deployment URL found.
+            console.log(`⚙️ No valid Managed Agent deployment for ${agentId}. Falling back to inline processing.`);
+
             const chatData = {
                 type: 'CHAT',
                 agentId,
